@@ -1,0 +1,126 @@
+# Fork-only workflow: build the memos Docker image from this fork and publish it
+# to GitHub Container Registry, so the instance can pull it directly.
+#
+# Why a separate file instead of upstream's build-canary-image.yml:
+#   * that workflow only runs on pushes to `main`, and this fork keeps `main` as
+#     a pure mirror of upstream, so it would build the wrong tree;
+#   * it logs in to Docker Hub and pushes to the `neosmemo/memos` and
+#     `ghcr.io/usememos/memos` namespaces, which a fork has no rights to and no
+#     secrets for.
+#
+# This file is fork-owned: upstream has no file with this name, so it never
+# conflicts when rebasing onto a newer upstream.
+name: Fork Image
+
+on:
+  # Pushing the change branch is what starts a build. workflow_dispatch is kept
+  # for the day this file also lands somewhere GitHub can list it: a dispatch
+  # entry only appears once the file exists on the default branch.
+  push:
+    branches: [feat/object-storage-image-derivatives]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Target platforms (comma separated)"
+        required: false
+        default: "linux/amd64"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # server/frontend/dist is baked into the binary by go:embed, and
+  # scripts/Dockerfile expects it to exist in the build context, so the SPA is
+  # built first and handed to the image job.
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v4.2.0
+        with:
+          version: 11.0.1
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: "web/pnpm-lock.yaml"
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+      - name: Setup pnpm cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - name: Run frontend build
+        run: pnpm release
+        working-directory: web
+
+      - name: Upload frontend artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: frontend-dist
+          path: server/frontend/dist
+          retention-days: 1
+
+  build-push:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Pushing to ghcr.io/<this repository> with the built-in token.
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version from commit date
+        id: version
+        run: echo "version=$(bash scripts/release_version.sh development-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-dist
+          path: server/frontend/dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # One buildx invocation publishes every requested platform as a manifest
+      # list, so no digest merge job is needed. Default is amd64 only: arm64 goes
+      # through QEMU and roughly triples the build time. Add "linux/arm64" (or
+      # dispatch the workflow with it) when the target host is arm64.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./scripts/Dockerfile
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ github.repository }}:fork
+            ghcr.io/${{ github.repository }}:${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: true
