@@ -39,18 +39,18 @@ permissions:
 jobs:
   # Resolved once so the image tags and the release tag can never disagree.
   #
-  # The release tag is `fork-<upstream release tag>-c.<build date>.<run number>`,
-  # for example `fork-v0.31.0-c.26.10.04.5`: it names the upstream version this
-  # fork is based on, the UTC day the image was built, and the run that produced
-  # it. Each part earns its place:
-  #   * the `fork-` prefix keeps the tag from starting with two digits. Upstream
-  #     moved to calendar versions, so their next release makes the upstream part
-  #     `26.10`, and `[1-9][0-9].*` is exactly what starts upstream's release
-  #     workflow on this fork. The prefix also keeps fork tags out of upstream's
-  #     namespaces, and `scripts/release_version.sh` only accepts CalVer, so the
-  #     repo's release tooling ignores these tags by design.
-  #   * the date says when the image was built, which a run number does not.
+  # The release tag is `<upstream release tag>-c.<build date>.<run number>`,
+  # for example `v0.31.0-c.26.10.04.5`: it names the upstream version this fork is
+  # based on, the UTC day the image was built, and the run that produced it.
+  #   * the date says when the image was built, which a run number does not;
   #   * the run number keeps a second build on the same day from colliding.
+  #
+  # Tags are created through the API by `gh release`, never pushed with git, and
+  # only a git push raises a `push` event. That matters once upstream's calendar
+  # versions make this tag start with two digits (`26.10-c.…`), because
+  # `[1-9][0-9].*` is the pattern that starts upstream's release workflow. Keep it
+  # that way: never `git push` a tag, and never `git push --tags` — the latter
+  # would push upstream's own calendar tags too.
   meta:
     runs-on: ubuntu-latest
     outputs:
@@ -70,7 +70,7 @@ jobs:
           # Build date in UTC, the clock the repository's own development version
           # is derived from.
           build_date="$(date -u +%y.%m.%d)"
-          fork_tag="fork-${upstream}-c.${build_date}.${{ github.run_number }}"
+          fork_tag="${upstream}-c.${build_date}.${{ github.run_number }}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "fork_tag=$fork_tag" >> "$GITHUB_OUTPUT"
           echo "development version: $version"
@@ -169,8 +169,11 @@ jobs:
   # A manifest list cannot be saved as a single tarball, so each platform is
   # pulled and saved on its own. Pulling does not need QEMU: the runner only has
   # to store the foreign-architecture image, never run it.
+  #
+  # The tarball carries the release tag in its name, so several builds can sit in
+  # one download folder without being told apart by hand.
   save-images:
-    needs: build-push
+    needs: [meta, build-push]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -195,15 +198,18 @@ jobs:
         run: docker pull --platform "${{ matrix.platform }}" "ghcr.io/${{ github.repository }}:fork"
 
       - name: Save the image as a loadable tarball
+        env:
+          FORK_TAG: ${{ needs.meta.outputs.fork_tag }}
         run: |
-          docker save "ghcr.io/${{ github.repository }}:fork" | gzip -1 > "memos-fork-${{ matrix.arch }}.tar.gz"
-          ls -lh "memos-fork-${{ matrix.arch }}.tar.gz"
+          name="memos-${FORK_TAG}-${{ matrix.arch }}.tar.gz"
+          docker save "ghcr.io/${{ github.repository }}:fork" | gzip -1 > "$name"
+          ls -lh "$name"
 
       - name: Upload the tarball
         uses: actions/upload-artifact@v6
         with:
           name: image-${{ matrix.arch }}
-          path: memos-fork-${{ matrix.arch }}.tar.gz
+          path: memos-*.tar.gz
           retention-days: 7
 
   release:
@@ -223,7 +229,7 @@ jobs:
           merge-multiple: true
 
       - name: Write checksums
-        run: sha256sum memos-fork-*.tar.gz > SHA256SUMS.txt && cat SHA256SUMS.txt
+        run: sha256sum memos-*.tar.gz > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - name: Write release notes
         run: |
@@ -246,7 +252,7 @@ jobs:
 
           ```bash
           sha256sum -c SHA256SUMS.txt
-          gunzip -c memos-fork-amd64.tar.gz | docker load    # or memos-fork-arm64.tar.gz
+          gunzip -c memos-${{ needs.meta.outputs.fork_tag }}-amd64.tar.gz | docker load   # or -arm64
           ```
 
           The image keeps the upstream layout: port 5230, non-root user, and a
@@ -268,30 +274,41 @@ jobs:
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG exists; refreshing its assets"
-            gh release upload "$TAG" \
-              memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt --clobber
+            gh release upload "$TAG" memos-*.tar.gz SHA256SUMS.txt --clobber
           else
             gh release create "$TAG" \
               --title "$TAG" \
               --notes-file NOTES.md \
               --target "${{ github.sha }}" \
-              memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt
+              memos-*.tar.gz SHA256SUMS.txt
           fi
 
       # Assets are ~53 MB per build and every build publishes one, so the list is
       # trimmed to the newest KEEP. Older images stay pullable from GHCR by their
       # own tag; only the downloadable tarballs age out. Raise KEEP to retain
       # more, or set it to 0 to keep everything.
+      #
+      # The release just published is excluded explicitly, and the candidates are
+      # printed before anything is deleted, so a log always shows what this step
+      # decided to do.
       - name: Trim old fork releases
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.fork_tag }}
           KEEP: "10"
         run: |
           [ "$KEEP" -gt 0 ] || exit 0
-          gh release list --limit 100 --json tagName,createdAt \
-            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName" |
-          while read -r old; do
-            [ -n "$old" ] || continue
-            echo "deleting old release $old"
-            gh release delete "$old" --yes --cleanup-tag
-          done
+          old="$(
+            gh release list --limit 100 --json tagName,createdAt \
+              --jq "map(select(.tagName != \"${TAG}\")) | sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName"
+          )"
+          if [ -z "$old" ]; then
+            echo "release list is within KEEP=${KEEP}; nothing to delete"
+            exit 0
+          fi
+          echo "releases beyond the newest ${KEEP}, about to be deleted:"
+          echo "$old"
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            gh release delete "$tag" --yes --cleanup-tag
+          done <<< "$old"
