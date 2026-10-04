@@ -302,6 +302,8 @@ go test  ./server/fileserver/... ./provider/storage/...
 git push origin main
 git push --force-with-lease origin feat/object-storage-image-derivatives
 # rebase 改写了提交，分支必须用 --force-with-lease（不要用 --force）
+# 绝不推送 tag：git push --tags 或 git push origin <tag> 会产生 push 事件，
+# 而上游 release.yml 监听 [1-9][0-9].*，会在 fork 上启动一个缺密钥的发布运行
 ```
 
 ### 10.4 冲突处理
@@ -417,17 +419,18 @@ git push origin feat/object-storage-image-derivatives
 ### Tag 规则
 
 ```
-fork-<上游发版号>-c.<构建日期 YY.MM.DD, UTC>.<运行号>
-例：fork-v0.31.0-c.26.10.04.4
+<上游发版号>-c.<构建日期 YY.MM.DD, UTC>.<运行号>
+例：v0.31.0-c.26.10.04.5
 ```
 
-三个部分各有理由：
+各部分的理由：
 
 | 部分 | 作用 |
 | --- | --- |
-| `fork-` 前缀 | **必需，不是装饰**。上游已改用 CalVer，他们下一次发版会让上游版本部分以两位数字开头（`26.10`），而 `[1-9][0-9].*` 正是触发上游发布工作流的 glob。前缀同时让 fork tag 不进入上游命名空间 |
 | 构建日期 | 说明镜像哪天构建的——运行号做不到这件事 |
 | 运行号 | 保证同一天多次构建不撞 tag；工作流级单调递增，永不重复 |
+
+**前缀问题（重要）**：tag 刻意不加 `fork-` 前缀。代价是上游改用 CalVer 之后，tag 会形如 `26.10-c.26.11.15`——**以两位数字开头**，而 `[1-9][0-9].*` 正是触发上游发布工作流的 glob。之所以仍可接受：**tag 由 `gh release create` 通过 API 创建，而 API 建 ref 不产生 `push` 事件**，只有 git 推送 tag 才会。因此唯一的纪律是**永不推送 tag**（见下方运维提示）。首次验证：本 fork 上由 API 创建的 tag 没有触发任何额外汇作流运行。
 
 上游版本号每次构建实时取自 `gh api repos/usememos/memos/releases/latest`，所以**上游发新版后 fork tag 自动跟随**。注意它表示"基于哪条上游发布线"，不等于"恰好是那个发版"——本分支基线通常是 `upstream/main` 的最新提交，领先最后一次发版。（`scripts/release_version.sh` 只接受 CalVer，所以本 fork 的 tag 官方工具链不认，这是刻意的。）
 
@@ -435,8 +438,10 @@ fork-<上游发版号>-c.<构建日期 YY.MM.DD, UTC>.<运行号>
 
 | 位置 | 内容 |
 | --- | --- |
-| GHCR | `ghcr.io/shinyes/memos:fork`（滚动）、`:<运行号>`、`:<完整 fork tag>`，三者指向同一 manifest list（amd64 + arm64） |
-| GitHub Release | 同名 tag 的 Release，附件 `memos-fork-amd64.tar.gz`（约 27 MB）、`memos-fork-arm64.tar.gz`（约 26 MB）、`SHA256SUMS.txt` |
+| GHCR | `ghcr.io/shinyes/memos:fork`（滚动）、`:<运行号>`、`:<完整 tag>`，三者指向同一 manifest list（amd64 + arm64） |
+| GitHub Release | 同名 tag 的 Release，附件 `memos-<tag>-amd64.tar.gz`（约 27 MB）、`memos-<tag>-arm64.tar.gz`（约 26 MB）、`SHA256SUMS.txt` |
+
+**tar 文件名带完整版本号**，例如 `memos-v0.31.0-c.26.10.04.5-amd64.tar.gz`，这样多次构建的下载文件放在同一个目录里也能分辨。代价是 `releases/latest/download/<文件名>` 这个固定链接不再固定（文件名随版本变化），下载时必须知道版本号——Release 页面和 `SHA256SUMS.txt` 里都有。
 
 保留最近 **10** 个 Release（改 `Trim old fork releases` 步骤里的 `KEEP`，设 `0` 表示全部保留）。更早的镜像仍可按自己的 tag 从 GHCR 拉取，只是可下载的 tar 附件会过期。
 
@@ -444,14 +449,13 @@ fork-<上游发版号>-c.<构建日期 YY.MM.DD, UTC>.<运行号>
 
 ```bash
 # 走 GHCR（包需为 public，或先 docker login ghcr.io）
-docker pull ghcr.io/shinyes/memos:fork-v0.31.0-c.26.10.04.4
+docker pull ghcr.io/shinyes/memos:v0.31.0-c.26.10.04.5
 ```
 
 ```bash
-# 或离线加载（固定链接始终指向最新 Release）
-# https://github.com/shinyes/memos/releases/latest/download/memos-fork-amd64.tar.gz
+# 或离线加载（从 Release 页面下载对应版本的 tar）
 sha256sum -c SHA256SUMS.txt
-gunzip -c memos-fork-amd64.tar.gz | docker load
+gunzip -c memos-v0.31.0-c.26.10.04.5-amd64.tar.gz | docker load
 ```
 
 镜像保持上游布局：端口 **5230**、非 root 用户、单二进制内嵌 SPA。它**不改数据库也不改对象存储**，可直接接管现有数据目录（见第 8 节）。
@@ -459,6 +463,6 @@ gunzip -c memos-fork-amd64.tar.gz | docker load
 ### 运维提示
 
 - **重跑同一个 run 是安全的**：`run_number` 不变，release 步骤检测到 Release 已存在时覆盖附件而不是失败。
-- **不要 `git push origin --tags`**：等上游发出第一个 CalVer tag 后，这条命令会把 `26.10` 这类 tag 推进 fork，从而触发上游的发布工作流。同步上游只用 `git fetch upstream --tags`（只读）。
+- **永不推送 tag**——这是本方案唯一的安全依赖。`git push origin <tag>` 和 `git push --tags` 都会产生 `push` 事件，而上游 `release.yml` 监听 `[1-9][0-9].*`；等上游改用 CalVer，本 fork 的 tag（`26.10-c.…`）与上游自己的 tag 都会落进这个模式，那些运行会在 fork 上启动却缺少密钥而失败。同步上游只用 `git fetch upstream --tags`（只读）。API 创建 tag（`gh release create`）不触发 `push` 事件，所以工作流自身是安全的。
 - 容器内嵌版本号是 `26.10` 这类开发版号（按 HEAD 提交日期推出，上游约定），与 fork 的 Release tag 不是一回事。
 
