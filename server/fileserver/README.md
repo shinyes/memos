@@ -7,6 +7,7 @@ The `fileserver` package serves binary content (attachments, avatars) over plain
 ```text
 GET /file/attachments/:uid[/:filename]   # attachment binary
     ?thumbnail=true                      # JPEG thumbnail for supported image types
+    ?original=true                       # the stored object, skipping any derivative
     ?motion=true                         # embedded motion-photo video clip
     ?share_token={uid}                   # access via a memo share link
 GET /file/users/:identifier/avatar       # user avatar (by username)
@@ -32,6 +33,7 @@ Avatars are public on instances that allow anonymous access; private instances r
 
 - **Video/audio** are streamed with range-request support (`http.ServeFile` / `http.ServeContent` for local and database storage); S3-backed media is proxied with ranged `GetObject` requests.
 - **Thumbnails** are generated at max 600px, cached in `{data_dir}/.thumbnail_cache/`, with a semaphore capping concurrent generation. Images with HDR/wide-gamut metadata are served as originals, since re-encoding would strip it.
+- **Derivatives from object storage**: a storage provider that transforms an object as it is read (Bitiful CoreIX and similar) produces the thumbnail and the in-page image for `image/heic` and `image/heif`, because this build has no decoder for them and no browser outside Safari renders them. The expressions live in `remoteThumbnailProcess` and `remoteDisplayProcess`; an empty expression disables the path and serves stored objects as before. Both derivatives are cached in `{data_dir}/.thumbnail_cache/` under their own names, and `?original=true` returns the stored object byte for byte so a download is unaffected.
 - **Motion photos** have their embedded video extracted and cached in `{data_dir}/.motion_cache/`.
 - **XSS prevention**: script-capable MIME types are rewritten to `application/octet-stream`, non-media files get `Content-Disposition: attachment`, and all responses carry `X-Content-Type-Options: nosniff` plus a restrictive `Content-Security-Policy`.
 - **Caching**: public attachments get `public, no-cache`; private ones `private, no-store`; avatars and thumbnails `public, max-age=3600`.

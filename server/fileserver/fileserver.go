@@ -41,6 +41,25 @@ const (
 	// thumbnailMaxSize is the maximum dimension (width or height) for thumbnails.
 	thumbnailMaxSize = 600
 
+	// displayCacheSuffix names the in-page derivative cache file. The name must
+	// stay in sync with store.deleteAttachmentDerivedCaches.
+	displayCacheSuffix = ".display.v1.avif"
+
+	// displayContentType is the media type of the in-page derivative. It must
+	// match the format the display expression asks the provider for, because the
+	// file server answers with nosniff.
+	displayContentType = "image/avif"
+
+	// remoteThumbnailProcess and remoteDisplayProcess are the processing
+	// expressions the file server hands to a storage provider that transforms an
+	// object as it is read. The thumbnail stays JPEG so its cache file name and
+	// content type are the ones the file server has always used; the in-page
+	// image uses AVIF, which is smaller at a larger edge. An empty expression
+	// disables the provider path and leaves every request served from the stored
+	// object.
+	remoteThumbnailProcess = "w=600&fmt=jpeg&q=80&cs=srgb"
+	remoteDisplayProcess   = "w=2560&fmt=avif&q=85"
+
 	// thumbnailMetadataProbeSize is the maximum number of original image bytes inspected
 	// before thumbnail generation to detect metadata that the JPEG thumbnail pipeline cannot preserve.
 	thumbnailMetadataProbeSize = 1 << 20
@@ -81,6 +100,52 @@ var thumbnailSupportedTypes = map[string]bool{
 	"image/heif": true,
 	"image/webp": true,
 }
+
+// displayDerivativeTypes contains image types the file server serves as a
+// provider-produced derivative on the attachment route, because no mainstream
+// browser renders the stored format. Every other type is served as stored.
+var displayDerivativeTypes = map[string]bool{
+	"image/heic": true,
+	"image/heif": true,
+}
+
+// imageDerivative describes one cached derived representation of an image
+// attachment. Cache file names must stay in sync with
+// store.deleteAttachmentDerivedCaches.
+type imageDerivative struct {
+	// cacheName builds the cache file name for an attachment UID.
+	cacheName func(uid string) string
+	// contentType is the media type the file server returns for the derivative.
+	contentType string
+	// process is the storage provider's processing expression. An empty
+	// expression disables the provider path for this derivative.
+	process string
+	// localFallback allows the local decoder to produce the derivative when the
+	// attachment is not on object storage.
+	localFallback bool
+}
+
+var (
+	// thumbnailDerivative is the list thumbnail: small, JPEG, and producible
+	// locally for the formats this build can decode.
+	thumbnailDerivative = imageDerivative{
+		cacheName:     func(uid string) string { return uid + ".v2.jpeg" },
+		contentType:   "image/jpeg",
+		process:       remoteThumbnailProcess,
+		localFallback: true,
+	}
+
+	// displayDerivative is the in-page image of a format the browser cannot
+	// decode. Only the storage provider produces it: this build has no HEIC
+	// decoder, and a local re-encode would flatten a wide-gamut or HDR image
+	// even if it had one.
+	displayDerivative = imageDerivative{
+		cacheName:     func(uid string) string { return uid + displayCacheSuffix },
+		contentType:   displayContentType,
+		process:       remoteDisplayProcess,
+		localFallback: false,
+	}
+)
 
 // avatarAllowedTypes contains MIME types allowed for user avatars.
 var avatarAllowedTypes = map[string]bool{
@@ -143,6 +208,7 @@ func (s *FileServerService) serveAttachmentFile(c *echo.Context) error {
 	uid := c.Param("uid")
 	wantThumbnail := c.QueryParam("thumbnail") == "true"
 	wantMotion := c.QueryParam("motion") == "true"
+	wantOriginal := c.QueryParam("original") == "true"
 
 	// Authorize on metadata alone. Database-stored bytes are loaded only
 	// after the read is permitted, so an unauthorized request never pulls a
@@ -183,7 +249,7 @@ func (s *FileServerService) serveAttachmentFile(c *echo.Context) error {
 		return s.serveMediaStream(c, attachment, contentType)
 	}
 
-	return s.serveStaticFile(c, attachment, contentType, wantThumbnail)
+	return s.serveStaticFile(c, attachment, contentType, wantThumbnail, wantOriginal)
 }
 
 // serveUserAvatar serves user avatar images.
@@ -262,7 +328,7 @@ func (s *FileServerService) serveMediaStream(c *echo.Context, attachment *store.
 }
 
 // serveStaticFile serves non-streaming files (images, documents, etc.).
-func (s *FileServerService) serveStaticFile(c *echo.Context, attachment *store.Attachment, contentType string, wantThumbnail bool) error {
+func (s *FileServerService) serveStaticFile(c *echo.Context, attachment *store.Attachment, contentType string, wantThumbnail bool, wantOriginal bool) error {
 	// Generate thumbnail for supported image types.
 	if wantThumbnail && thumbnailSupportedTypes[attachment.Type] {
 		if thumbnailBlob, err := s.getOrGenerateThumbnail(c.Request().Context(), attachment); err != nil {
@@ -271,8 +337,23 @@ func (s *FileServerService) serveStaticFile(c *echo.Context, attachment *store.A
 			}
 		} else {
 			setSecurityHeaders(c)
-			setMediaHeaders(c, "image/jpeg", attachment.Type)
-			return c.Blob(http.StatusOK, "image/jpeg", thumbnailBlob)
+			setMediaHeaders(c, thumbnailDerivative.contentType, attachment.Type)
+			return c.Blob(http.StatusOK, thumbnailDerivative.contentType, thumbnailBlob)
+		}
+	}
+
+	// Serve the derivative of an image the browser cannot decode. The stored
+	// object stays reachable through ?original=true, so a download still returns
+	// the file exactly as uploaded.
+	if !wantOriginal && !wantThumbnail && displayDerivativeTypes[attachment.Type] {
+		if displayBlob, err := s.getOrGenerateDisplayImage(c.Request().Context(), attachment); err != nil {
+			if !errors.Is(err, errUseOriginalForThumbnail) {
+				slog.Warn("failed to get display image", "error", err)
+			}
+		} else {
+			setSecurityHeaders(c)
+			setMediaHeaders(c, displayDerivative.contentType, attachment.Type)
+			return c.Blob(http.StatusOK, displayDerivative.contentType, displayBlob)
 		}
 	}
 
@@ -411,26 +492,39 @@ func singleRangeHeader(header http.Header) string {
 // =============================================================================
 
 // getOrGenerateThumbnail returns the thumbnail image of the attachment.
-// Uses semaphore to limit concurrent thumbnail generation and prevent memory exhaustion.
 func (s *FileServerService) getOrGenerateThumbnail(ctx context.Context, attachment *store.Attachment) ([]byte, error) {
-	thumbnailPath, err := s.getThumbnailPath(attachment)
+	return s.getOrGenerateDerivative(ctx, attachment, thumbnailDerivative)
+}
+
+// getOrGenerateDisplayImage returns the in-page image of the attachment.
+func (s *FileServerService) getOrGenerateDisplayImage(ctx context.Context, attachment *store.Attachment) ([]byte, error) {
+	return s.getOrGenerateDerivative(ctx, attachment, displayDerivative)
+}
+
+// getOrGenerateDerivative returns a derived image of the attachment, reusing the
+// cached file when it exists. It uses the semaphore to limit concurrent
+// generation and prevent memory exhaustion, and reports
+// errUseOriginalForThumbnail when the attachment has no derivative and the
+// stored object must be served instead.
+func (s *FileServerService) getOrGenerateDerivative(ctx context.Context, attachment *store.Attachment, derivative imageDerivative) ([]byte, error) {
+	derivativePath, err := s.getDerivativePath(attachment, derivative)
 	if err != nil {
 		return nil, err
 	}
 
-	// Fast path: return cached thumbnail if exists.
-	if blob, err := os.ReadFile(thumbnailPath); err == nil {
+	// Fast path: return cached derivative if exists.
+	if blob, err := os.ReadFile(derivativePath); err == nil {
 		return blob, nil
 	}
-	if _, err := os.Stat(thumbnailPath + thumbnailFailedMarkerSuffix); err == nil {
+	if _, err := os.Stat(derivativePath + thumbnailFailedMarkerSuffix); err == nil {
 		return nil, errUseOriginalForThumbnail
 	}
 
-	useOriginal, err := s.shouldUseOriginalForThumbnail(ctx, attachment)
+	produce, err := s.derivativeProducer(ctx, attachment, derivative)
 	if err != nil {
 		return nil, err
 	}
-	if useOriginal {
+	if produce == nil {
 		return nil, errUseOriginalForThumbnail
 	}
 
@@ -441,38 +535,77 @@ func (s *FileServerService) getOrGenerateThumbnail(ctx context.Context, attachme
 	defer s.thumbnailSemaphore.Release(1)
 
 	// Double-check after acquiring semaphore (another goroutine may have generated it).
-	if blob, err := os.ReadFile(thumbnailPath); err == nil {
+	if blob, err := os.ReadFile(derivativePath); err == nil {
 		return blob, nil
 	}
-	if _, err := os.Stat(thumbnailPath + thumbnailFailedMarkerSuffix); err == nil {
+	if _, err := os.Stat(derivativePath + thumbnailFailedMarkerSuffix); err == nil {
 		return nil, errUseOriginalForThumbnail
 	}
 
-	blob, err := s.generateThumbnail(ctx, attachment, thumbnailPath)
-	if errors.Is(err, errThumbnailUnsupported) && ctx.Err() == nil {
-		// Remember the verdict so the next request serves the original
-		// without decoding again. A canceled request is not a verdict on the
-		// image. The marker is removed with the attachment's other derived
-		// caches.
-		if markerErr := os.WriteFile(thumbnailPath+thumbnailFailedMarkerSuffix, nil, 0644); markerErr != nil {
-			slog.Warn("failed to record thumbnail failure", "error", markerErr)
+	blob, err := produce(ctx)
+	if err != nil {
+		if errors.Is(err, errThumbnailUnsupported) && ctx.Err() == nil {
+			// Remember the verdict so the next request serves the original
+			// without producing again. A canceled request is not a verdict on
+			// the image. The marker is removed with the attachment's other
+			// derived caches.
+			if markerErr := os.WriteFile(derivativePath+thumbnailFailedMarkerSuffix, nil, 0644); markerErr != nil {
+				slog.Warn("failed to record derivative failure", "error", markerErr)
+			}
 		}
+		return nil, err
 	}
-	return blob, err
+	if err := os.WriteFile(derivativePath, blob, 0644); err != nil {
+		return nil, errors.Wrap(err, "failed to save derivative")
+	}
+	return blob, nil
 }
 
-// getThumbnailPath returns the file path for a cached thumbnail.
-func (s *FileServerService) getThumbnailPath(attachment *store.Attachment) (string, error) {
+// derivativeProducer returns the function that produces a derivative, or nil
+// when the attachment has no derivative and the stored object must be served.
+func (s *FileServerService) derivativeProducer(ctx context.Context, attachment *store.Attachment, derivative imageDerivative) (func(context.Context) ([]byte, error), error) {
+	if s.canProcessRemotely(attachment, derivative) {
+		return func(ctx context.Context) ([]byte, error) {
+			return s.generateRemoteDerivative(ctx, attachment, derivative.process)
+		}, nil
+	}
+	if !derivative.localFallback {
+		return nil, nil
+	}
+	useOriginal, err := s.shouldUseOriginalForThumbnail(ctx, attachment)
+	if err != nil {
+		return nil, err
+	}
+	if useOriginal {
+		return nil, nil
+	}
+	return func(ctx context.Context) ([]byte, error) {
+		return s.generateThumbnail(ctx, attachment)
+	}, nil
+}
+
+// canProcessRemotely reports whether the configured storage can produce the
+// derivative. Only managed object storage has a processing pipeline; local and
+// database storage serve what they hold.
+func (s *FileServerService) canProcessRemotely(attachment *store.Attachment, derivative imageDerivative) bool {
+	return derivative.process != "" && attachment.StorageType == storepb.AttachmentStorageType_S3
+}
+
+// getDerivativePath returns the file path for a cached derivative.
+func (s *FileServerService) getDerivativePath(attachment *store.Attachment, derivative imageDerivative) (string, error) {
 	cacheFolder := filepath.Join(s.Profile.Data, thumbnailCacheFolder)
 	if err := os.MkdirAll(cacheFolder, os.ModePerm); err != nil {
 		return "", errors.Wrap(err, "failed to create thumbnail cache folder")
 	}
-	filename := fmt.Sprintf("%s.v2.jpeg", attachment.UID)
-	return filepath.Join(cacheFolder, filename), nil
+	return filepath.Join(cacheFolder, derivative.cacheName(attachment.UID)), nil
 }
 
 func (s *FileServerService) shouldUseOriginalForThumbnail(ctx context.Context, attachment *store.Attachment) (bool, error) {
 	if attachment.Type == "image/heic" || attachment.Type == "image/heif" {
+		// These formats only reach the local producer when the storage provider
+		// cannot process them: this build has no HEIC decoder, and a local
+		// re-encode would flatten a wide-gamut or HDR image even if it had one.
+		// Serving the original keeps the image intact.
 		return true, nil
 	}
 
@@ -533,8 +666,9 @@ func hasThumbnailSensitiveMetadata(data []byte) bool {
 	return false
 }
 
-// generateThumbnail creates a new thumbnail and saves it to disk.
-func (s *FileServerService) generateThumbnail(ctx context.Context, attachment *store.Attachment, thumbnailPath string) ([]byte, error) {
+// generateThumbnail creates a new thumbnail from the stored image with the local
+// decoder.
+func (s *FileServerService) generateThumbnail(ctx context.Context, attachment *store.Attachment) ([]byte, error) {
 	// Bound the decode before paying for it: the pixel count is read from
 	// the header, and the upload path only enforces it for the formats it
 	// re-encodes, so a stored image may still declare far more pixels than
@@ -563,11 +697,43 @@ func (s *FileServerService) generateThumbnail(ctx context.Context, attachment *s
 	if err := imaging.Encode(&buf, thumbnailImage, imaging.JPEG, imaging.JPEGQuality(90)); err != nil {
 		return nil, errors.Wrap(err, "failed to encode thumbnail")
 	}
-	if err := os.WriteFile(thumbnailPath, buf.Bytes(), 0644); err != nil {
-		return nil, errors.Wrap(err, "failed to save thumbnail")
-	}
 
 	return buf.Bytes(), nil
+}
+
+// generateRemoteDerivative asks the configured storage provider to produce a
+// derivative of the stored object. A provider that refuses the object is a
+// verdict on the image and is remembered; a transport or server failure is
+// transient and is retried on the next request.
+func (s *FileServerService) generateRemoteDerivative(ctx context.Context, attachment *store.Attachment, process string) ([]byte, error) {
+	blob, err := s.getAttachmentProcessedBlob(ctx, attachment, process)
+	if err != nil {
+		if errors.Is(err, storage.ErrObjectProcessingRefused) {
+			return nil, errors.Wrapf(errThumbnailUnsupported, "storage provider refused the image: %v", err)
+		}
+		return nil, errors.Wrap(err, "failed to read processed object")
+	}
+	return blob, nil
+}
+
+// getAttachmentProcessedBlob reads an attachment through the storage provider's
+// processing pipeline, which transforms the object as it is read.
+func (s *FileServerService) getAttachmentProcessedBlob(ctx context.Context, attachment *store.Attachment, process string) ([]byte, error) {
+	driver, s3Object, err := s.Store.ResolveAttachmentS3Driver(ctx, attachment)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := driver.GetProcessedObjectStream(ctx, s3Object.Key, "", process)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Body.Close()
+
+	blob, err := io.ReadAll(stream.Body)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read processed object body")
+	}
+	return blob, nil
 }
 
 // checkThumbnailSourceBounds reads the image header and refuses images whose

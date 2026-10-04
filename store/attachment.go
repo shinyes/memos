@@ -384,13 +384,16 @@ func AttachmentNeedsInstanceStorageSetting(attachment *Attachment) bool {
 
 // deleteAttachmentDerivedCaches removes every derived asset the file server
 // may have written for the attachment: the current thumbnail, its failure
-// marker, the pre-v2 thumbnail name, and the extracted motion clip. The names
-// must match server/fileserver.
+// marker, the pre-v2 thumbnail name, the in-page derivative and its failure
+// marker, and the extracted motion clip. The names must match
+// server/fileserver.
 func (s *Store) deleteAttachmentDerivedCaches(attachment *Attachment) {
 	for _, cachePath := range []string{
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".v2.jpeg"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".v2.jpeg.failed"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".jpeg"),
+		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v1.avif"),
+		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v1.avif.failed"),
 		filepath.Join(s.profile.Data, motionCacheFolder, attachment.UID+".mp4"),
 	} {
 		if err := os.Remove(cachePath); err != nil && !os.IsNotExist(err) {
