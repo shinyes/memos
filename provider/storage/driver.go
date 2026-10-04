@@ -14,6 +14,11 @@ import (
 // the object, so HTTP handlers can answer 416 instead of 500.
 var ErrRangeNotSatisfiable = s3.ErrRangeNotSatisfiable
 
+// ErrObjectProcessingRefused reports a provider that refused to process an
+// object, which callers treat as a verdict on the object rather than as a
+// transient read failure.
+var ErrObjectProcessingRefused = s3.ErrObjectProcessingRefused
+
 // RangeNotSatisfiableError carries response metadata for an unsatisfied range.
 type RangeNotSatisfiableError = s3.RangeNotSatisfiableError
 
@@ -29,6 +34,12 @@ type Driver interface {
 	// an HTTP Range header and yields a partial object. byteRange must request at
 	// most one range because S3 does not support multipart range responses.
 	GetObjectStream(ctx context.Context, key string, byteRange string) (*ObjectStream, error)
+	// GetProcessedObjectStream streams an object after asking the provider to
+	// apply a processing expression to it. process is a raw query string in the
+	// provider's own vocabulary; an empty process returns the stored object and
+	// is equivalent to GetObjectStream. Providers that cannot process an object
+	// answer with ErrObjectProcessingRefused.
+	GetProcessedObjectStream(ctx context.Context, key string, byteRange string, process string) (*ObjectStream, error)
 	DeleteObject(ctx context.Context, key string) error
 }
 

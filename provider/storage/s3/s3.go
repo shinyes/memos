@@ -25,6 +25,12 @@ import (
 // the object, so HTTP handlers can answer 416 instead of 500.
 var ErrRangeNotSatisfiable = errors.New("requested range not satisfiable")
 
+// ErrObjectProcessingRefused reports a provider that answered a processed read
+// with a client error, which means the object cannot be processed as asked
+// rather than that the read failed. Callers treat it as a verdict on the object
+// and stop asking.
+var ErrObjectProcessingRefused = errors.New("object processing refused")
+
 // RangeNotSatisfiableError carries response metadata for an unsatisfied range.
 type RangeNotSatisfiableError struct {
 	ContentRange string
@@ -139,6 +145,49 @@ func forceSignedPayload(stack *middleware.Stack) error {
 	return err
 }
 
+// addProcessQuery appends a provider processing expression to the request query
+// string before SigV4 signs the request, so the signature covers the
+// expression. Object stores that transform an object as it is read (Bitiful
+// CoreIX, Aliyun OSS image processing, and similar) require the parameters to
+// be part of the signed request; a parameter added after signing fails the
+// signature check.
+func addProcessQuery(process string) func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		return stack.Finalize.Insert(&appendProcessQuery{process: process}, "Signing", middleware.Before)
+	}
+}
+
+// appendProcessQuery carries one processing expression into the signing stack.
+type appendProcessQuery struct {
+	process string
+}
+
+// ID identifies the middleware in the stack.
+func (*appendProcessQuery) ID() string { return "MemosAppendProcessQuery" }
+
+// HandleFinalize appends the expression to the request query string.
+func (m *appendProcessQuery) HandleFinalize(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+	if req, ok := in.Request.(*smithyhttp.Request); ok && m.process != "" {
+		if req.URL.RawQuery == "" {
+			req.URL.RawQuery = m.process
+		} else {
+			req.URL.RawQuery += "&" + m.process
+		}
+	}
+	return next.HandleFinalize(ctx, in)
+}
+
+// isClientError reports whether the provider answered with a 4xx status, which
+// means the request was understood and refused rather than that it failed.
+func isClientError(err error) bool {
+	var responseErr *smithyhttp.ResponseError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+	status := responseErr.HTTPStatusCode()
+	return status >= http.StatusBadRequest && status < http.StatusInternalServerError
+}
+
 // UploadObject uploads an object to S3.
 func (c *Driver) UploadObject(ctx context.Context, key string, fileType string, content io.Reader) (string, error) {
 	putInput := s3.PutObjectInput{
@@ -172,6 +221,19 @@ func (c *Driver) GetObject(ctx context.Context, key string) ([]byte, error) {
 // yields a partial object with ContentRange set. Callers must supply at most
 // one range because S3 does not support multipart range responses.
 func (c *Driver) GetObjectStream(ctx context.Context, key string, byteRange string) (*ObjectStream, error) {
+	return c.GetProcessedObjectStream(ctx, key, byteRange, "")
+}
+
+// GetProcessedObjectStream retrieves an object as a stream, asking the provider
+// to apply the processing expression in process first. process is a raw query
+// string (for example "w=600&fmt=avif"), appended to the request and covered by
+// its signature; an empty process returns the stored object unchanged, and a
+// non-empty byteRange is forwarded as described on GetObjectStream.
+//
+// Providers without a processing pipeline ignore query parameters they do not
+// define, so callers should pass an expression only for storages configured to
+// understand one.
+func (c *Driver) GetProcessedObjectStream(ctx context.Context, key string, byteRange string, process string) (*ObjectStream, error) {
 	input := &s3.GetObjectInput{
 		Bucket: c.Bucket,
 		Key:    aws.String(key),
@@ -179,7 +241,17 @@ func (c *Driver) GetObjectStream(ctx context.Context, key string, byteRange stri
 	if byteRange != "" {
 		input.Range = aws.String(byteRange)
 	}
-	output, err := c.Client.GetObject(ctx, input)
+	var options []func(*s3.Options)
+	if process != "" {
+		options = append(options, func(o *s3.Options) {
+			// Copy before appending: o.APIOptions shares its backing array with
+			// the client's options, and concurrent reads must not write into it.
+			apiOptions := make([]func(*middleware.Stack) error, len(o.APIOptions), len(o.APIOptions)+1)
+			copy(apiOptions, o.APIOptions)
+			o.APIOptions = append(apiOptions, addProcessQuery(process))
+		})
+	}
+	output, err := c.Client.GetObject(ctx, input, options...)
 	if err != nil {
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRange" {
@@ -198,6 +270,9 @@ func (c *Driver) GetObjectStream(ctx context.Context, key string, byteRange stri
 				}
 			}
 			return nil, rangeErr
+		}
+		if process != "" && isClientError(err) {
+			return nil, errors.Wrapf(ErrObjectProcessingRefused, "provider refused %q: %v", process, err)
 		}
 		return nil, errors.Wrap(err, "failed to get object")
 	}
