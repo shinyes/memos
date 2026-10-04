@@ -37,6 +37,37 @@ permissions:
   contents: read
 
 jobs:
+  # Resolved once so the image tags and the release tag can never disagree.
+  #
+  # The release tag is `<upstream release tag>-c.<run number>`, for example
+  # v0.31.0-c.3: it names the upstream version this fork is based on, stays
+  # unique across builds, and deliberately avoids two tag shapes that would
+  # misfire here:
+  #   * `[1-9][0-9].*` starts upstream's release workflow on this fork;
+  #   * `v0.x` is upstream's retired legacy namespace, and
+  #     scripts/release_version.sh rejects anything but CalVer anyway, so this
+  #     tag is for this fork only and the repo's release tooling ignores it.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      fork_tag: ${{ steps.resolve.outputs.fork_tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve the build version and the release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(bash scripts/release_version.sh development-version)"
+          upstream="$(gh api repos/usememos/memos/releases/latest --jq .tag_name 2>/dev/null || true)"
+          upstream="${upstream:-v0.0.0}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=${upstream}-c.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "development version: $version"
+          echo "release tag:         ${upstream}-c.${{ github.run_number }}"
+
   # server/frontend/dist is baked into the binary by go:embed, and
   # scripts/Dockerfile expects it to exist in the build context, so the SPA is
   # built first and handed to the image job.
@@ -77,7 +108,7 @@ jobs:
           retention-days: 1
 
   build-push:
-    needs: build-frontend
+    needs: [meta, build-frontend]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -85,10 +116,6 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v6
-
-      - name: Resolve version from commit date
-        id: version
-        run: echo "version=$(bash scripts/release_version.sh development-version)" >> "$GITHUB_OUTPUT"
 
       - name: Download frontend artifacts
         uses: actions/download-artifact@v7
@@ -121,11 +148,12 @@ jobs:
           file: ./scripts/Dockerfile
           platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
           build-args: |
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=${{ needs.meta.outputs.version }}
             COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/${{ github.repository }}:fork
             ghcr.io/${{ github.repository }}:${{ github.run_number }}
+            ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.fork_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
@@ -171,11 +199,15 @@ jobs:
           retention-days: 7
 
   release:
-    needs: save-images
+    needs: [meta, save-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # gh release create runs git, so the job needs a checkout even though it
+      # only uploads files it downloaded.
+      - uses: actions/checkout@v6
+
       - name: Download the image tarballs
         uses: actions/download-artifact@v7
         with:
@@ -190,6 +222,7 @@ jobs:
           cat > NOTES.md <<'EOF'
           Fork build of the memos image, produced by the `Fork Image` workflow.
 
+          - Fork release tag: `${{ needs.meta.outputs.fork_tag }}`
           - Commit: `${{ github.sha }}`
           - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           - Platforms: linux/amd64, linux/arm64
@@ -197,8 +230,8 @@ jobs:
           ## Pull from GitHub Container Registry
 
           ```bash
-          docker pull ghcr.io/${{ github.repository }}:fork              # latest build
-          docker pull ghcr.io/${{ github.repository }}:${{ github.run_number }}   # this build
+          docker pull ghcr.io/${{ github.repository }}:fork                          # latest build
+          docker pull ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.fork_tag }}   # this build
           ```
 
           ## Or load an attached image
@@ -217,14 +250,12 @@ jobs:
 
       # --target pins the tag to the commit that was built; without it gh would
       # tag the default branch, which on this fork is the upstream mirror.
-      # The tag is deliberately not CalVer: a `[1-9][0-9].*` tag would start
-      # upstream's release workflow on this fork.
       - name: Create the release with the image assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "fork-${{ github.run_number }}" \
-            --title "Fork image ${{ github.run_number }}" \
+          gh release create "${{ needs.meta.outputs.fork_tag }}" \
+            --title "Fork image ${{ needs.meta.outputs.fork_tag }}" \
             --notes-file NOTES.md \
             --target "${{ github.sha }}" \
             memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt
