@@ -258,12 +258,40 @@ jobs:
 
       # --target pins the tag to the commit that was built; without it gh would
       # tag the default branch, which on this fork is the upstream mirror.
-      - name: Create the release with the image assets
+      #
+      # Re-running a workflow run keeps its run number, so on a retry the tag
+      # already exists: refresh the assets instead of failing.
+      - name: Create or refresh the release with the image assets
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.fork_tag }}
         run: |
-          gh release create "${{ needs.meta.outputs.fork_tag }}" \
-            --title "${{ needs.meta.outputs.fork_tag }}" \
-            --notes-file NOTES.md \
-            --target "${{ github.sha }}" \
-            memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; refreshing its assets"
+            gh release upload "$TAG" \
+              memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file NOTES.md \
+              --target "${{ github.sha }}" \
+              memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt
+          fi
+
+      # Assets are ~53 MB per build and every build publishes one, so the list is
+      # trimmed to the newest KEEP. Older images stay pullable from GHCR by their
+      # own tag; only the downloadable tarballs age out. Raise KEEP to retain
+      # more, or set it to 0 to keep everything.
+      - name: Trim old fork releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: "10"
+        run: |
+          [ "$KEEP" -gt 0 ] || exit 0
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName" |
+          while read -r old; do
+            [ -n "$old" ] || continue
+            echo "deleting old release $old"
+            gh release delete "$old" --yes --cleanup-tag
+          done
