@@ -455,7 +455,10 @@ docker pull ghcr.io/shinyes/memos:v0.31.0-c.26.10.04.5
 ```bash
 # 或离线加载（从 Release 页面下载对应版本的 tar）
 sha256sum -c SHA256SUMS.txt
-gunzip -c memos-v0.31.0-c.26.10.04.5-amd64.tar.gz | docker load
+gunzip -c memos-v0.31.0-c.26.10.04.6-amd64.tar.gz | docker load
+# 载入后镜像同时带两个 tag：
+#   ghcr.io/shinyes/memos:v0.31.0-c.26.10.04.6   ← 推荐写进 compose：固定、可追溯
+#   ghcr.io/shinyes/memos:fork                   ← 便捷别名；载入旧 tar 会让它回退
 ```
 
 镜像保持上游布局：端口 **5230**、非 root 用户、单二进制内嵌 SPA。它**不改数据库也不改对象存储**，可直接接管现有数据目录（见第 8 节）。
