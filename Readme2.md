@@ -396,9 +396,69 @@ git log --oneline upstream/main -- server/fileserver/fileserver.go provider/stor
 | `.heic-poc/` | 前期调研工具（`probe.exe` 探测 HEIC、`bench.exe` 编码基准、合成样本） | 已在排除列表；G1/G3 验证时可继续用 |
 | `.heic-poc-cache/` | Go 模块与构建缓存（约 2.8 GB） | 已在排除列表；纯缓存，可安全删除（下次构建重新下载） |
 
-尚未推送到 `origin`。要备份到 GitHub 时：
+分支已推送到 `origin`（推送同时触发镜像构建，见第 13 节）。后续推送：
 
 ```bash
-git push -u origin feat/object-storage-image-derivatives
+git push origin feat/object-storage-image-derivatives
 ```
+
+---
+
+## 13. 镜像构建与部署
+
+上游的 `build-canary-image.yml` **在 fork 上无法使用**：它只监听 `push: branches: [main]`（本 fork 的 `main` 是上游纯镜像），并硬编码推送到 `neosmemo/memos`（Docker Hub）和 `ghcr.io/usememos/memos`，还要 `DOCKER_HUB_*` 密钥——fork 对这两个命名空间没有写权限，也没有这些密钥。所以本 fork 自建了 [.github/workflows/fork-image.yml](.github/workflows/fork-image.yml)。
+
+### 触发条件
+
+- 推送到 `feat/object-storage-image-derivatives` 分支；
+- **纯 `.md` 提交被忽略**（`paths-ignore: ['**.md']`），改本文档不会重建镜像；
+- 手动 dispatch 需要工作流文件存在于默认分支才会出现在 Actions UI 里，而本 fork 的 `main` 是上游纯镜像，所以实际以推送触发为准。
+
+### Tag 规则
+
+```
+fork-<上游发版号>-c.<构建日期 YY.MM.DD, UTC>.<运行号>
+例：fork-v0.31.0-c.26.10.04.4
+```
+
+三个部分各有理由：
+
+| 部分 | 作用 |
+| --- | --- |
+| `fork-` 前缀 | **必需，不是装饰**。上游已改用 CalVer，他们下一次发版会让上游版本部分以两位数字开头（`26.10`），而 `[1-9][0-9].*` 正是触发上游发布工作流的 glob。前缀同时让 fork tag 不进入上游命名空间 |
+| 构建日期 | 说明镜像哪天构建的——运行号做不到这件事 |
+| 运行号 | 保证同一天多次构建不撞 tag；工作流级单调递增，永不重复 |
+
+上游版本号每次构建实时取自 `gh api repos/usememos/memos/releases/latest`，所以**上游发新版后 fork tag 自动跟随**。注意它表示"基于哪条上游发布线"，不等于"恰好是那个发版"——本分支基线通常是 `upstream/main` 的最新提交，领先最后一次发版。（`scripts/release_version.sh` 只接受 CalVer，所以本 fork 的 tag 官方工具链不认，这是刻意的。）
+
+### 产出
+
+| 位置 | 内容 |
+| --- | --- |
+| GHCR | `ghcr.io/shinyes/memos:fork`（滚动）、`:<运行号>`、`:<完整 fork tag>`，三者指向同一 manifest list（amd64 + arm64） |
+| GitHub Release | 同名 tag 的 Release，附件 `memos-fork-amd64.tar.gz`（约 27 MB）、`memos-fork-arm64.tar.gz`（约 26 MB）、`SHA256SUMS.txt` |
+
+保留最近 **10** 个 Release（改 `Trim old fork releases` 步骤里的 `KEEP`，设 `0` 表示全部保留）。更早的镜像仍可按自己的 tag 从 GHCR 拉取，只是可下载的 tar 附件会过期。
+
+### 部署
+
+```bash
+# 走 GHCR（包需为 public，或先 docker login ghcr.io）
+docker pull ghcr.io/shinyes/memos:fork-v0.31.0-c.26.10.04.4
+```
+
+```bash
+# 或离线加载（固定链接始终指向最新 Release）
+# https://github.com/shinyes/memos/releases/latest/download/memos-fork-amd64.tar.gz
+sha256sum -c SHA256SUMS.txt
+gunzip -c memos-fork-amd64.tar.gz | docker load
+```
+
+镜像保持上游布局：端口 **5230**、非 root 用户、单二进制内嵌 SPA。它**不改数据库也不改对象存储**，可直接接管现有数据目录（见第 8 节）。
+
+### 运维提示
+
+- **重跑同一个 run 是安全的**：`run_number` 不变，release 步骤检测到 Release 已存在时覆盖附件而不是失败。
+- **不要 `git push origin --tags`**：等上游发出第一个 CalVer tag 后，这条命令会把 `26.10` 这类 tag 推进 fork，从而触发上游的发布工作流。同步上游只用 `git fetch upstream --tags`（只读）。
+- 容器内嵌版本号是 `26.10` 这类开发版号（按 HEAD 提交日期推出，上游约定），与 fork 的 Release tag 不是一回事。
 
