@@ -1,5 +1,6 @@
-# Fork-only workflow: build the memos Docker image from this fork and publish it
-# to GitHub Container Registry, so the instance can pull it directly.
+# Fork-only workflow: build the memos Docker image from this fork, publish it to
+# GitHub Container Registry, and attach the image tarballs to a GitHub Release so
+# the host can `docker load` them without pulling from a registry.
 #
 # Why a separate file instead of upstream's build-canary-image.yml:
 #   * that workflow only runs on pushes to `main`, and this fork keeps `main` as
@@ -13,17 +14,20 @@
 name: Fork Image
 
 on:
-  # Pushing the change branch is what starts a build. workflow_dispatch is kept
-  # for the day this file also lands somewhere GitHub can list it: a dispatch
-  # entry only appears once the file exists on the default branch.
+  # Pushing the change branch is what starts a build. Documentation-only pushes
+  # are ignored so editing Readme2 does not publish a new image.
   push:
     branches: [feat/object-storage-image-derivatives]
+    paths-ignore:
+      - "**.md"
+  # A dispatch entry only appears in the Actions UI once this file exists on the
+  # default branch, which this fork deliberately keeps as an upstream mirror.
   workflow_dispatch:
     inputs:
       platforms:
         description: "Target platforms (comma separated)"
         required: false
-        default: "linux/amd64"
+        default: "linux/amd64,linux/arm64"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -106,15 +110,16 @@ jobs:
           password: ${{ github.token }}
 
       # One buildx invocation publishes every requested platform as a manifest
-      # list, so no digest merge job is needed. Default is amd64 only: arm64 goes
-      # through QEMU and roughly triples the build time. Add "linux/arm64" (or
-      # dispatch the workflow with it) when the target host is arm64.
+      # list, so no digest merge job is needed. scripts/Dockerfile builds from
+      # --platform=$BUILDPLATFORM and cross-compiles with GOARCH=$TARGETARCH, so
+      # the arm64 binary is a native amd64 compile: QEMU only covers the few RUN
+      # steps in the target image, not the Go build.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./scripts/Dockerfile
-          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
           build-args: |
             VERSION=${{ steps.version.outputs.version }}
             COMMIT=${{ github.sha }}
@@ -124,3 +129,102 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
+
+  # A manifest list cannot be saved as a single tarball, so each platform is
+  # pulled and saved on its own. Pulling does not need QEMU: the runner only has
+  # to store the foreign-architecture image, never run it.
+  save-images:
+    needs: build-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Pull the image for this platform
+        run: docker pull --platform "${{ matrix.platform }}" "ghcr.io/${{ github.repository }}:fork"
+
+      - name: Save the image as a loadable tarball
+        run: |
+          docker save "ghcr.io/${{ github.repository }}:fork" | gzip -1 > "memos-fork-${{ matrix.arch }}.tar.gz"
+          ls -lh "memos-fork-${{ matrix.arch }}.tar.gz"
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v6
+        with:
+          name: image-${{ matrix.arch }}
+          path: memos-fork-${{ matrix.arch }}.tar.gz
+          retention-days: 7
+
+  release:
+    needs: save-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the image tarballs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: image-*
+          merge-multiple: true
+
+      - name: Write checksums
+        run: sha256sum memos-fork-*.tar.gz > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          cat > NOTES.md <<'EOF'
+          Fork build of the memos image, produced by the `Fork Image` workflow.
+
+          - Commit: `${{ github.sha }}`
+          - Workflow run: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - Platforms: linux/amd64, linux/arm64
+
+          ## Pull from GitHub Container Registry
+
+          ```bash
+          docker pull ghcr.io/${{ github.repository }}:fork              # latest build
+          docker pull ghcr.io/${{ github.repository }}:${{ github.run_number }}   # this build
+          ```
+
+          ## Or load an attached image
+
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          gunzip -c memos-fork-amd64.tar.gz | docker load    # or memos-fork-arm64.tar.gz
+          ```
+
+          The image keeps the upstream layout: port 5230, non-root user, and a
+          single binary with the SPA embedded. It carries this fork's changes and
+          touches neither the database nor object storage, so it can take over an
+          existing data directory.
+          EOF
+          cat NOTES.md
+
+      # --target pins the tag to the commit that was built; without it gh would
+      # tag the default branch, which on this fork is the upstream mirror.
+      # The tag is deliberately not CalVer: a `[1-9][0-9].*` tag would start
+      # upstream's release workflow on this fork.
+      - name: Create the release with the image assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "fork-${{ github.run_number }}" \
+            --title "Fork image ${{ github.run_number }}" \
+            --notes-file NOTES.md \
+            --target "${{ github.sha }}" \
+            memos-fork-amd64.tar.gz memos-fork-arm64.tar.gz SHA256SUMS.txt
