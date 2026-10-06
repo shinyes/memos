@@ -42,8 +42,10 @@ const (
 	thumbnailMaxSize = 600
 
 	// displayCacheSuffix names the in-page derivative cache file. The name must
-	// stay in sync with store.deleteAttachmentDerivedCaches.
-	displayCacheSuffix = ".display.v3.avif"
+	// stay in sync with store.deleteAttachmentDerivedCaches. It keeps the v2 name:
+	// the only builds that ever wrote it were already guarded against caching an
+	// untransformed answer.
+	displayCacheSuffix = ".display.v2.avif"
 
 	// displayContentType is the media type of the in-page derivative. It must
 	// match the format the display expression asks the provider for, because the
