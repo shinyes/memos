@@ -443,7 +443,7 @@ git push origin feat/object-storage-image-derivatives
 
 | 位置 | 内容 |
 | --- | --- |
-| GHCR | `ghcr.io/shinyes/memos:fork`（滚动）、`:<运行号>`、`:<完整 tag>`，三者指向同一 manifest list（amd64 + arm64） |
+| GHCR | `ghcr.io/shinyes/memos:<完整 tag>` 与 `:<运行号>`，指向同一 manifest list（amd64 + arm64）。早期版本还有个滚动的 `:fork` 别名，已去掉——导入旧 tar 时它会覆盖本机的同名标签 |
 | GitHub Release | 同名 tag 的 Release，附件 `memos-<tag>-amd64.tar.gz`（约 27 MB）、`memos-<tag>-arm64.tar.gz`（约 26 MB）、`SHA256SUMS.txt` |
 
 **tar 文件名带完整版本号**，例如 `memos-v0.31.0-c.26.10.04.5-amd64.tar.gz`，这样多次构建的下载文件放在同一个目录里也能分辨。代价是 `releases/latest/download/<文件名>` 这个固定链接不再固定（文件名随版本变化），下载时必须知道版本号——Release 页面和 `SHA256SUMS.txt` 里都有。

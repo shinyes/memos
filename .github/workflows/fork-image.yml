@@ -159,7 +159,6 @@ jobs:
             VERSION=${{ needs.meta.outputs.version }}
             COMMIT=${{ github.sha }}
           tags: |
-            ghcr.io/${{ github.repository }}:fork
             ghcr.io/${{ github.repository }}:${{ github.run_number }}
             ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.fork_tag }}
           cache-from: type=gha
@@ -195,21 +194,18 @@ jobs:
           password: ${{ github.token }}
 
       - name: Pull the image for this platform
-        run: docker pull --platform "${{ matrix.platform }}" "ghcr.io/${{ github.repository }}:fork"
+        env:
+          FORK_TAG: ${{ needs.meta.outputs.fork_tag }}
+        run: docker pull --platform "${{ matrix.platform }}" "ghcr.io/${{ github.repository }}:${FORK_TAG}"
 
       - name: Save the image as a loadable tarball
         env:
           FORK_TAG: ${{ needs.meta.outputs.fork_tag }}
         run: |
           name="memos-${FORK_TAG}-${{ matrix.arch }}.tar.gz"
-          image="ghcr.io/${{ github.repository }}"
-          # The tarball must carry the release tag and nothing else: whatever tags
-          # it holds are the tags the host ends up with after `docker load`, and a
-          # moving alias in there would silently re-point a host's `:fork` to an
-          # older build.
-          docker tag "${image}:fork" "${image}:${FORK_TAG}"
-          docker rmi "${image}:fork"
-          docker save "${image}:${FORK_TAG}" | gzip -1 > "$name"
+          # Saved by its release tag, so the tarball carries exactly the one tag the
+          # host should end up with after `docker load`.
+          docker save "ghcr.io/${{ github.repository }}:${FORK_TAG}" | gzip -1 > "$name"
           ls -lh "$name"
 
       - name: Upload the tarball
@@ -251,8 +247,8 @@ jobs:
           ## Pull from GitHub Container Registry
 
           ```bash
-          docker pull ghcr.io/${{ github.repository }}:fork                          # latest build
           docker pull ghcr.io/${{ github.repository }}:${{ needs.meta.outputs.fork_tag }}   # this build
+          docker pull ghcr.io/${{ github.repository }}:${{ github.run_number }}   # the same build, short alias
           ```
 
           ## Or load an attached image
