@@ -1,6 +1,11 @@
 # Readme2 — HEIC 显示支持：把图片处理交给对象存储，memos 只做代理
 
 这份文档记录了本 fork 相对上游的全部改动、改动理由、运维配置、迁移步骤和回退方式。
+> **提供商变更（重要）**：处理表达式已从 Bitiful CoreIX 语法改为**腾讯云图片处理（数据万象）**的 `imageMogr2` 语法——本 fork 只支持一家。因此：
+>
+> - 附件必须存放在**能理解该语法的桶**（腾讯云 COS）里。否则 provider 会原样返回存储对象，memos 会安全回退到原图（HEIC 在浏览器里显示不出来），并在日志打印 `returned the stored object instead of processing it`；
+> - **部署顺序**：先把对象迁到 COS、把存储条目的 endpoint 指过去，**再**部署这个构建。顺序反了会出现"所有 HEIC 都不显示"的窗口期，**包括你现在能看的那些旧照片**（它们当前读的是还留着的 Bitiful S4）；
+> - 文中性能、缓存与限制部分的具体数字，是上一轮针对 Bitiful CoreIX 实测得到的，尚未逐条在腾讯云上复测。
 
 - 基线版本：`usememos/memos` @ `0d989707`（`git describe` = `v0.31.0-33-g0d989707`）
 - 改动范围：**4 个 Go 文件 + 1 个 README**，外加 2 个测试文件；不涉及 proto、数据库、前端
@@ -50,7 +55,7 @@
 
 ### 3.1 `provider/storage/s3/s3.go`（+76 / -1）
 
-- 新增 `GetProcessedObjectStream(ctx, key, byteRange, process)`：`process` 是原始 query string（如 `w=600&fmt=avif`），**在 SigV4 签名之前**追加到请求 query string，因此签名覆盖它。`GetObjectStream` 变成它的空 `process` 包装。
+- 新增 `GetProcessedObjectStream(ctx, key, byteRange, process)`：`process` 是原始 query string（如 `imageMogr2/thumbnail/600x/format/avif`），**在 SigV4 签名之前**追加到请求 query string，因此签名覆盖它。`GetObjectStream` 变成它的空 `process` 包装。
 - 新增 `addProcessQuery` 中间件：用 `middleware.Stack.Finalize.Insert(..., "Signing", middleware.Before)` 插入——与仓库已有的 `excludeAcceptEncodingFromSigning` / `forceSignedPayload` 同一套路。追加时**复制 `o.APIOptions` 切片**，避免并发写客户端共享的底层数组。
 - 新增 `ErrObjectProcessingRefused`：provider 用 4xx 回答处理请求时归类为"对这张图的判决"；5xx/网络错误保持可重试。由 `isClientError` 判定。
 
@@ -96,8 +101,8 @@
 参数是**包级常量**，位于 `server/fileserver/fileserver.go`：
 
 ```go
-remoteThumbnailProcess = "w=600&fmt=jpeg&q=80&cs=srgb"
-remoteDisplayProcess   = "w=2560&fmt=avif&q=85"
+remoteThumbnailProcess = "imageMogr2/thumbnail/600x/format/jpg/quality/80"
+remoteDisplayProcess   = "imageMogr2/thumbnail/2560x/format/avif/quality/85"
 ```
 
 - 缩略图用 `fmt=jpeg`：这样缓存文件名（`.v2.jpeg`）与响应 `Content-Type`（`image/jpeg`）与改动前完全一致，不必改动任何既有路径。
@@ -113,7 +118,7 @@ remoteDisplayProcess   = "w=2560&fmt=avif&q=85"
 | 层 | 行为 |
 | --- | --- |
 | memos 本地磁盘（主力） | `.thumbnail_cache/{uid}.v2.jpeg`（缩略图）与 `.thumbnail_cache/{uid}.display.v1.avif`（display），各带 `.failed` 标记。永久、跨重启；**每张图每个尺寸只调用 provider 一次** |
-| S4 侧 | 不生成派生对象。CoreIX 是只读转换，桶里保持干净，没有孤儿对象需要清理 |
+| 对象存储侧 | 不生成派生对象。腾讯云图片处理是只读转换，桶里保持干净，没有孤儿对象需要清理 |
 | 浏览器 | 保持官方 `private, no-store` 不变（这是官方为私有内容的刻意选择；本地缓存已经消除了重复处理成本） |
 
 失败语义与仓库既有设计一致：**只有** `errThumbnailUnsupported`（永久判决，例如 provider 4xx）才写 `.failed` 标记，之后的请求直接回退原图；网络/5xx 故障不写标记，下次请求重试。
@@ -122,7 +127,7 @@ remoteDisplayProcess   = "w=2560&fmt=avif&q=85"
 
 ---
 
-## 6. 迁移指导：RustFS → Bitiful S4
+## 6. 迁移指导：把附件迁到能处理图片的对象存储（腾讯云 COS）
 
 ### 6.1 关键前提
 
@@ -138,12 +143,12 @@ remoteDisplayProcess   = "w=2560&fmt=avif&q=85"
 cp "$DATA/memos_prod.db" "$DATA/memos_prod.db.bak"
 
 # 2) 对拷对象，保持 key 一致（rclone 两个 S3 remote，都是 S3 兼容）
-rclone copy rustfs:$BUCKET s4:$BUCKET --checksum --progress
+rclone copy rustfs:$BUCKET cos:$BUCKET --checksum --progress
 
 # 3) 校验：对象数量与抽样字节一致
-rclone check rustfs:$BUCKET s4:$BUCKET --size-only
+rclone check rustfs:$BUCKET cos:$BUCKET --size-only
 
-# 4) 在 memos 里把原 storage 条目的 S3 配置改为 S4
+# 4) 在 memos 里把原 storage 条目的 S3 配置改为 COS
 #    endpoint / region / access key / secret / bucket，通常需要打开 UsePathStyle
 #    存储条目 Id 必须保持不变
 
@@ -154,7 +159,7 @@ rclone check rustfs:$BUCKET s4:$BUCKET --size-only
 
 - 随机抽 5 个附件下载，字节与原 RustFS 对象一致；
 - 未开启派生图时 `?thumbnail=true` 行为与迁移前一致；
-- 打开相册时 **memos 进程 CPU 基本不动**（这是成功的标志：解码编码都在 S4 侧）；
+- 打开相册时 **memos 进程 CPU 基本不动**（这是成功的标志：解码编码都在腾讯云侧）；
 - `{data}/.thumbnail_cache/` 出现 `.v2.jpeg` 与 `.display.v1.avif`。
 
 ---
@@ -165,11 +170,11 @@ rclone check rustfs:$BUCKET s4:$BUCKET --size-only
 
 | 关卡 | 验什么 | 怎么验 | 不通过的后果 |
 | --- | --- | --- | --- |
-| **G1** | provider 能否处理你的真实小米 HEIC | 传一张到 S4，控制台 URL 预览加 `?w=600&fmt=jpeg&q=80&cs=srgb` 与 `?w=2560&fmt=avif&q=85` | 派生图永远失败，回退原图（不崩，但没效果） |
-| **G2** | 处理参数能否**随签名**生效 | 用本 fork 直接跑：如果 S4 拒绝，日志会出现 `storage provider refused ...`，且 `.failed` 标记写入 | 需要改用外部生成器方案 |
+| **G1** | provider 能否处理你的真实小米 HEIC | 传一张到 COS，在控制台用 URL 预览加 `?imageMogr2/thumbnail/600x/format/jpg/quality/80` 与 `?imageMogr2/thumbnail/2560x/format/avif/quality/85` | 派生图永远失败，回退原图（不崩，但没效果） |
+| **G2** | 处理参数能否**随签名**生效 | 用本 fork 直接跑：如果 COS 拒绝，日志会出现 `storage provider refused ...`，且 `.failed` 标记写入 | 需要改用外部生成器方案 |
 | **G3** | 方向与 HDR | 竖拍照片方向是否正确；HDR 照片是否发灰（必要时给 display 也加 `cs=srgb`）；**`w=2560` 是否会把小图放大** | 需要调整参数常量 |
 
-G2 的机制部分已在本仓库离线验证（见第 9 节：参数确实进入签名请求并被发送），但**S4 服务端是否接受签名覆盖这些参数只能连真实账号验证**。
+G2 的机制部分已在本仓库离线验证（见第 9 节：参数确实进入签名请求并被发送），但**腾讯云是否接受签名覆盖这些参数只能连真实账号验证**。
 
 ---
 
@@ -181,14 +186,14 @@ G2 的机制部分已在本仓库离线验证（见第 9 节：参数确实进�
 | --- | --- | --- |
 | 数据库 schema | 否 | 无迁移、无版本变更 |
 | `AttachmentPayload` | 否 | 官方照常读出对象键与 `storage_id` |
-| S4 桶里的对象与键 | 否 | 官方用同一套 S3 配置读同一批键 |
+| 对象存储桶里的对象与键 | 否 | 官方用同一套 S3 配置读同一批键 |
 | `.thumbnail_cache/{uid}.v2.jpeg` | 内容来源变为 provider，但仍是 JPEG、文件名不变 | 官方直接命中缓存并当 `image/jpeg` 发出，**照常显示** |
 | `.thumbnail_cache/{uid}.display.v1.avif` | 新增 | 官方不认识、永不读取，只是占盘 |
 
 刻意避开了两条会给"交给官方"制造麻烦的路：
 
 1. **没有往 `AttachmentPayload` 加字段**——payload 以 protojson 存储，三个驱动的反序列化器都设了 `DiscardUnknown: true`，官方读到你加的字段不会报错，但**下次写这一行时会静默丢掉它**；
-2. **没有在 S4 里生成派生对象**——否则桶里会积累官方不认识的孤儿对象，且官方的删除逻辑不会级联清理。
+2. **没有在对象存储里生成派生对象**——否则桶里会积累官方不认识的孤儿对象，且官方的删除逻辑不会级联清理。
 
 ### 回退到官方版本
 
@@ -362,12 +367,12 @@ git log --oneline upstream/main -- server/fileserver/fileserver.go provider/stor
 
 ## 11. 已知限制
 
-1. **原图仍带 GPS**：CoreIX 只在输出派生图时删 Exif，**不改桶内原图**；而 memos 的 HEIC 上传路径依旧无法剥 EXIF（没有解码器）。这一点与改动前一致，不是新引入的问题。要连原片也不留位置信息需要单独处理。
+1. **原图仍带 GPS**：腾讯云图片处理只在输出派生图时删 Exif，**不改桶内原图**；而 memos 的 HEIC 上传路径依旧无法剥 EXIF（没有解码器）。这一点与改动前一致，不是新引入的问题。要连原片也不留位置信息需要单独处理。
 2. **HEIC 里的动态照片不会被识别**：动态照片检测只在 `image/jpeg` / `image/jpg` 上触发。
-3. **display 派生图不缓存到 S4**：这是刻意的（避免孤儿对象），代价是换设备/清缓存后每个尺寸会重新调用一次 provider。
+3. **display 派生图不缓存到对象存储**：这是刻意的（避免孤儿对象），代价是换设备/清缓存后每个尺寸会重新调用一次 provider。
 4. **参数改常量需重编译**，且改参数要手动提升缓存文件名版本（见第 5 节）。
 5. **裸 URL 语义变化**：HEIC 上不再等于"存储里的字节"；需要原片请带 `?original=true`。归档不受影响——导出/导入走服务端直读存储（`GetAttachmentBlob`），不经过 `/file` 路由。
-6. **G2/G3 未在真实 S4 上验证**（见第 7 节）。
+6. **G1/G2/G3 未在真实腾讯云账号上验证**（见第 7 节）。
 
 ---
 
