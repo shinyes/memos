@@ -395,6 +395,8 @@ func (s *Store) deleteAttachmentDerivedCaches(attachment *Attachment) {
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".v2.jpeg"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".v2.jpeg.failed"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".jpeg"),
+		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v3.avif"),
+		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v3.avif.failed"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v2.avif"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v2.avif.failed"),
 		filepath.Join(s.profile.Data, thumbnailCacheFolder, attachment.UID+".display.v1.avif"),
