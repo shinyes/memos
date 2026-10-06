@@ -924,8 +924,8 @@ func TestServeAttachmentFile_ThumbnailRefusesOversizedImage(t *testing.T) {
 		require.Equal(t, bomb, rec.Body.Bytes(), "original is served instead of a thumbnail")
 	}
 	uid := strings.TrimPrefix(attachment.Name, "attachments/")
-	require.NoFileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, uid+".v2.jpeg"))
-	require.FileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, uid+".v2.jpeg"+thumbnailFailedMarkerSuffix))
+	require.NoFileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, thumbnailDerivative.cacheName(uid)))
+	require.FileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, thumbnailDerivative.cacheName(uid)+thumbnailFailedMarkerSuffix))
 }
 
 // newSharedProfileTestServices builds the API service, file server, and
@@ -977,7 +977,7 @@ func TestDeleteAttachmentRemovesCachedThumbnail(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, "image/jpeg", rec.Header().Get(echo.HeaderContentType))
 	uid := strings.TrimPrefix(attachment.Name, "attachments/")
-	thumbnailPath := filepath.Join(fs.Profile.Data, thumbnailCacheFolder, uid+".v2.jpeg")
+	thumbnailPath := filepath.Join(fs.Profile.Data, thumbnailCacheFolder, thumbnailDerivative.cacheName(uid))
 	require.FileExists(t, thumbnailPath)
 
 	ownerCtx := context.WithValue(ctx, auth.UserIDContextKey, owner.ID)
@@ -1015,7 +1015,7 @@ func TestThumbnailFailureMarkerOnlyForUnsupportedImages(t *testing.T) {
 	fs.RegisterRoutes(e)
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/file/%s/gone.png?thumbnail=true", attachment.Name), nil))
-	marker := filepath.Join(fs.Profile.Data, thumbnailCacheFolder, uid+".v2.jpeg"+thumbnailFailedMarkerSuffix)
+	marker := filepath.Join(fs.Profile.Data, thumbnailCacheFolder, thumbnailDerivative.cacheName(uid)+thumbnailFailedMarkerSuffix)
 	require.NoFileExists(t, marker, "a read failure is not a verdict on the image")
 
 	// Once the bytes are back, the thumbnail is generated normally.

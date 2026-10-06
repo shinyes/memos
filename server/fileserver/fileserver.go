@@ -42,8 +42,10 @@ const (
 	thumbnailMaxSize = 600
 
 	// displayCacheSuffix names the in-page derivative cache file. The name must
-	// stay in sync with store.deleteAttachmentDerivedCaches.
-	displayCacheSuffix = ".display.v1.avif"
+	// stay in sync with store.deleteAttachmentDerivedCaches. v2 because v1 entries
+	// could hold bytes the provider never transformed, which the file name and the
+	// served media type both misdescribed.
+	displayCacheSuffix = ".display.v2.avif"
 
 	// displayContentType is the media type of the in-page derivative. It must
 	// match the format the display expression asks the provider for, because the
@@ -51,14 +53,14 @@ const (
 	displayContentType = "image/avif"
 
 	// remoteThumbnailProcess and remoteDisplayProcess are the processing
-	// expressions the file server hands to a storage provider that transforms an
-	// object as it is read. The thumbnail stays JPEG so its cache file name and
-	// content type are the ones the file server has always used; the in-page
-	// image uses AVIF, which is smaller at a larger edge. An empty expression
-	// disables the provider path and leaves every request served from the stored
-	// object.
-	remoteThumbnailProcess = "w=600&fmt=jpeg&q=80&cs=srgb"
-	remoteDisplayProcess   = "w=2560&fmt=avif&q=85"
+	// expressions handed to a storage provider that transforms an object as it is
+	// read. They use Tencent Cloud image processing (数据万象) syntax. The
+	// thumbnail stays JPEG so its cache file name and content type are the ones
+	// the file server has always used; the in-page image uses AVIF, which needs
+	// 图片高级压缩 enabled on the bucket. An empty expression disables the provider
+	// path and leaves every request served from the stored object.
+	remoteThumbnailProcess = "imageMogr2/thumbnail/600x/format/jpg/quality/80"
+	remoteDisplayProcess   = "imageMogr2/thumbnail/2560x/format/avif/quality/85"
 
 	// thumbnailMetadataProbeSize is the maximum number of original image bytes inspected
 	// before thumbnail generation to detect metadata that the JPEG thumbnail pipeline cannot preserve.
@@ -127,9 +129,10 @@ type imageDerivative struct {
 
 var (
 	// thumbnailDerivative is the list thumbnail: small, JPEG, and producible
-	// locally for the formats this build can decode.
+	// locally for the formats this build can decode. v3 because a v2 entry may
+	// hold an untransformed object that a provider without a pipeline returned.
 	thumbnailDerivative = imageDerivative{
-		cacheName:     func(uid string) string { return uid + ".v2.jpeg" },
+		cacheName:     func(uid string) string { return uid + ".v3.jpeg" },
 		contentType:   "image/jpeg",
 		process:       remoteThumbnailProcess,
 		localFallback: true,
@@ -566,7 +569,7 @@ func (s *FileServerService) getOrGenerateDerivative(ctx context.Context, attachm
 func (s *FileServerService) derivativeProducer(ctx context.Context, attachment *store.Attachment, derivative imageDerivative) (func(context.Context) ([]byte, error), error) {
 	if s.canProcessRemotely(attachment, derivative) {
 		return func(ctx context.Context) ([]byte, error) {
-			return s.generateRemoteDerivative(ctx, attachment, derivative.process)
+			return s.generateRemoteDerivative(ctx, attachment, derivative)
 		}, nil
 	}
 	if !derivative.localFallback {
@@ -705,35 +708,66 @@ func (s *FileServerService) generateThumbnail(ctx context.Context, attachment *s
 // derivative of the stored object. A provider that refuses the object is a
 // verdict on the image and is remembered; a transport or server failure is
 // transient and is retried on the next request.
-func (s *FileServerService) generateRemoteDerivative(ctx context.Context, attachment *store.Attachment, process string) ([]byte, error) {
-	blob, err := s.getAttachmentProcessedBlob(ctx, attachment, process)
+//
+// A backend with no processing pipeline ignores the expression and answers with
+// the stored object; that answer must not be cached or served as the derivative,
+// because the bytes would be labelled with a format they are not.
+func (s *FileServerService) generateRemoteDerivative(ctx context.Context, attachment *store.Attachment, derivative imageDerivative) ([]byte, error) {
+	blob, contentType, err := s.getAttachmentProcessedBlob(ctx, attachment, derivative.process)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectProcessingRefused) {
 			return nil, errors.Wrapf(errThumbnailUnsupported, "storage provider refused the image: %v", err)
 		}
 		return nil, errors.Wrap(err, "failed to read processed object")
 	}
+	// A backend with no processing pipeline ignores the expression and answers
+	// with the stored object, whose media type is the one the attachment was
+	// uploaded with. That answer is not a derivative: caching it under the
+	// derivative's name would label the bytes with a format they are not. Any
+	// other answer is treated as the requested derivative, including a provider
+	// that labels its output with a generic type, because the alternative —
+	// refusing a real conversion over a header — is worse than serving it.
+	if sameMediaType(contentType, attachment.Type) {
+		slog.Warn("storage provider returned the stored object instead of processing it; serving the stored object",
+			"attachment_uid", attachment.UID,
+			"stored_type", attachment.Type,
+			"returned_type", contentType,
+			"process", derivative.process)
+		return nil, errUseOriginalForThumbnail
+	}
 	return blob, nil
 }
 
+// sameMediaType compares two media types ignoring parameters and case, so
+// "image/avif; charset=utf-8" matches "image/avif".
+func sameMediaType(left string, right string) bool {
+	normalize := func(value string) string {
+		mediaType, _, _ := strings.Cut(value, ";")
+		return strings.ToLower(strings.TrimSpace(mediaType))
+	}
+	return normalize(left) == normalize(right)
+}
+
 // getAttachmentProcessedBlob reads an attachment through the storage provider's
-// processing pipeline, which transforms the object as it is read.
-func (s *FileServerService) getAttachmentProcessedBlob(ctx context.Context, attachment *store.Attachment, process string) ([]byte, error) {
+// processing pipeline, which transforms the object as it is read. It also returns
+// the media type the provider reported for what it returned, which is how a
+// caller tells a transformed answer from the stored object.
+func (s *FileServerService) getAttachmentProcessedBlob(ctx context.Context, attachment *store.Attachment, process string) ([]byte, string, error) {
 	driver, s3Object, err := s.Store.ResolveAttachmentS3Driver(ctx, attachment)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	stream, err := driver.GetProcessedObjectStream(ctx, s3Object.Key, "", process)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer stream.Body.Close()
 
 	blob, err := io.ReadAll(stream.Body)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to read processed object body")
+		return nil, "", errors.Wrap(err, "failed to read processed object body")
 	}
-	return blob, nil
+	return blob, stream.ContentType, nil
 }
 
 // checkThumbnailSourceBounds reads the image header and refuses images whose
