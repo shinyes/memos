@@ -53,6 +53,11 @@ type ObjectStream struct {
 	// ContentRange echoes the backend's Content-Range header for partial reads;
 	// empty when the whole object is returned.
 	ContentRange string
+	// ContentType is the media type the backend reported for what it returned. A
+	// backend that ignores a processing expression answers with the stored
+	// object's own type, which is how a caller tells that nothing was
+	// transformed.
+	ContentType string
 }
 
 // Driver stores attachment objects in an S3-compatible object store.
@@ -285,6 +290,9 @@ func (c *Driver) GetProcessedObjectStream(ctx context.Context, key string, byteR
 	}
 	if output.ContentRange != nil {
 		stream.ContentRange = *output.ContentRange
+	}
+	if output.ContentType != nil {
+		stream.ContentType = *output.ContentType
 	}
 	return stream, nil
 }
