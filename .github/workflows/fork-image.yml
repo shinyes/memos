@@ -260,6 +260,14 @@ jobs:
           gunzip -c memos-${{ needs.meta.outputs.fork_tag }}-amd64.tar.gz | docker load   # or -arm64
           ```
 
+          ## 适用范围：腾讯云对象存储 COS
+
+          本构建的图片处理表达式面向**腾讯云 COS（数据万象）**：
+
+          - 附件必须存放在 COS 桶中。其它 S3 兼容存储不认识 `imageMogr2` 语法，会原样返回对象，memos 会安全回退到原图（HEIC 在浏览器里显示不出来）。
+          - 输出 AVIF 需要在数据万象中开通**图片高级压缩**。未开通时 COS 会对 `format/avif` 静默返回 JPEG，本构建会拒绝该答案并回退原图，而不是把 JPEG 当成 AVIF 发出去。
+          - 缩略图使用 JPEG（与本地编码器共用一个缓存文件），页面大图使用 AVIF。实测 600px：AVIF 57 KB / WebP 81 KB / JPEG 104 KB。
+
           The image keeps the upstream layout: port 5230, non-root user, and a
           single binary with the SPA embedded. It carries this fork's changes and
           touches neither the database nor object storage, so it can take over an
