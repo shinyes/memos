@@ -42,10 +42,8 @@ const (
 	thumbnailMaxSize = 600
 
 	// displayCacheSuffix names the in-page derivative cache file. The name must
-	// stay in sync with store.deleteAttachmentDerivedCaches. v2 because v1 entries
-	// could hold bytes the provider never transformed, which the file name and the
-	// served media type both misdescribed.
-	displayCacheSuffix = ".display.v2.avif"
+	// stay in sync with store.deleteAttachmentDerivedCaches.
+	displayCacheSuffix = ".display.v3.avif"
 
 	// displayContentType is the media type of the in-page derivative. It must
 	// match the format the display expression asks the provider for, because the
@@ -54,11 +52,18 @@ const (
 
 	// remoteThumbnailProcess and remoteDisplayProcess are the processing
 	// expressions handed to a storage provider that transforms an object as it is
-	// read. They use Tencent Cloud image processing (数据万象) syntax. The
-	// thumbnail stays JPEG so its cache file name and content type are the ones
-	// the file server has always used; the in-page image uses AVIF, which needs
-	// 图片高级压缩 enabled on the bucket. An empty expression disables the provider
-	// path and leaves every request served from the stored object.
+	// read. They use Tencent Cloud image processing (数据万象) syntax.
+	//
+	// The thumbnail asks for JPEG because the same cache file is also written by
+	// the local encoder, so its media type has to hold for both producers. The
+	// in-page image asks for AVIF, measured on a real bucket at 57 KB for a 600 px
+	// edge against 81 KB for WebP and 104 KB for JPEG. AVIF output needs
+	// 图片高级压缩 enabled on the bucket: while it was off, the bucket answered
+	// format/avif with JPEG without saying so, which the strict format check below
+	// turns into a fallback to the stored object instead of a mislabelled image.
+	//
+	// An empty expression disables the provider path and leaves every request
+	// served from the stored object.
 	remoteThumbnailProcess = "imageMogr2/thumbnail/600x/format/jpg/quality/80"
 	remoteDisplayProcess   = "imageMogr2/thumbnail/2560x/format/avif/quality/85"
 
@@ -727,17 +732,17 @@ func (s *FileServerService) generateRemoteDerivative(ctx context.Context, attach
 			"process", derivative.process)
 		return nil, errUseOriginalForThumbnail
 	}
-	// A backend with no processing pipeline ignores the expression and answers
-	// with the stored object, whose media type is the one the attachment was
-	// uploaded with. That answer is not a derivative: caching it under the
-	// derivative's name would label the bytes with a format they are not. Any
-	// other answer is treated as the requested derivative, including a provider
-	// that labels its output with a generic type, because the alternative —
-	// refusing a real conversion over a header — is worse than serving it.
-	if sameMediaType(contentType, attachment.Type) {
-		slog.Warn("storage provider returned the stored object instead of processing it; serving the stored object",
+	// The answer must be the format that was asked for. That covers a backend
+	// with no processing pipeline, which returns the stored object, and one that
+	// silently substitutes another format — Tencent COS answers format/avif with
+	// JPEG unless 图片高级压缩 is enabled. Caching either under the derivative's
+	// name would label the bytes with a format they are not, so the stored object
+	// is served instead.
+	if !sameMediaType(contentType, derivative.contentType) {
+		slog.Warn("storage provider did not answer with the requested format; serving the stored object",
 			"attachment_uid", attachment.UID,
 			"stored_type", attachment.Type,
+			"requested_type", derivative.contentType,
 			"returned_type", contentType,
 			"process", derivative.process)
 		return nil, errUseOriginalForThumbnail

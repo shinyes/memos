@@ -70,7 +70,7 @@ func TestServeAttachmentFile_ProviderFormatIsServedAsTheDerivative(t *testing.T)
 	fs, fake, attachment, key, cleanup := newHeicOnObjectStorage(ctx, t)
 	defer cleanup()
 
-	// Stand in for a provider that honoured fmt=avif.
+	// Stand in for a provider that honoured format/avif.
 	require.NoError(t, fake.PutObject("derivative-attachments", key, "image/avif", []byte("rendered avif")))
 
 	display := getAttachment(t, fs, attachment, "")
@@ -133,4 +133,32 @@ func TestServeAttachmentFile_UnprocessedAnswerIsNotTreatedAsADerivative(t *testi
 	require.Equal(t, http.StatusOK, original.Code)
 	require.Equal(t, "image/heic", original.Header().Get(echo.HeaderContentType))
 	require.Equal(t, []byte("stored heic bytes"), original.Body.Bytes())
+}
+
+// A provider that silently substitutes another format must not have that answer
+// cached or served as the in-page derivative. Tencent COS does exactly this: it
+// answers format/avif with JPEG unless 图片高级压缩 is enabled, which is why the
+// display derivative asks for WebP and insists on getting it.
+func TestServeAttachmentFile_SubstitutedFormatIsNotTheDisplayDerivative(t *testing.T) {
+	ctx := context.Background()
+	fs, fake, attachment, key, cleanup := newHeicOnObjectStorage(ctx, t)
+	defer cleanup()
+
+	// The provider was asked for WebP and answered with JPEG.
+	require.NoError(t, fake.PutObject("derivative-attachments", key, "image/jpeg", []byte("substituted jpeg")))
+
+	display := getAttachment(t, fs, attachment, "")
+	require.Equal(t, http.StatusOK, display.Code)
+	require.NotEqual(t, displayContentType, display.Header().Get(echo.HeaderContentType), "JPEG must not be served as the in-page derivative")
+
+	uid := strings.TrimPrefix(attachment.Name, "attachments/")
+	require.NoFileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, uid+displayCacheSuffix),
+		"a substituted format must not be cached as the in-page derivative")
+
+	// The thumbnail asked for JPEG and got JPEG, so that answer is legitimate.
+	thumbnail := getAttachment(t, fs, attachment, "?thumbnail=true")
+	require.Equal(t, http.StatusOK, thumbnail.Code)
+	require.Equal(t, "image/jpeg", thumbnail.Header().Get(echo.HeaderContentType))
+	require.Equal(t, []byte("substituted jpeg"), thumbnail.Body.Bytes())
+	require.FileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, thumbnailDerivative.cacheName(uid)))
 }
