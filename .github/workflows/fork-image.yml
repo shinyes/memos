@@ -202,12 +202,14 @@ jobs:
           FORK_TAG: ${{ needs.meta.outputs.fork_tag }}
         run: |
           name="memos-${FORK_TAG}-${{ matrix.arch }}.tar.gz"
-          # Tag the pulled image with the release tag before saving: the tag is
-          # what the host ends up with after `docker load`, so without it the
-          # version would live only in the file name and two loaded tarballs
-          # would be told apart by nothing.
-          docker tag "ghcr.io/${{ github.repository }}:fork" "ghcr.io/${{ github.repository }}:${FORK_TAG}"
-          docker save "ghcr.io/${{ github.repository }}:fork" "ghcr.io/${{ github.repository }}:${FORK_TAG}" | gzip -1 > "$name"
+          image="ghcr.io/${{ github.repository }}"
+          # The tarball must carry the release tag and nothing else: whatever tags
+          # it holds are the tags the host ends up with after `docker load`, and a
+          # moving alias in there would silently re-point a host's `:fork` to an
+          # older build.
+          docker tag "${image}:fork" "${image}:${FORK_TAG}"
+          docker rmi "${image}:fork"
+          docker save "${image}:${FORK_TAG}" | gzip -1 > "$name"
           ls -lh "$name"
 
       - name: Upload the tarball
