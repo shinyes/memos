@@ -715,10 +715,17 @@ func (s *FileServerService) generateThumbnail(ctx context.Context, attachment *s
 func (s *FileServerService) generateRemoteDerivative(ctx context.Context, attachment *store.Attachment, derivative imageDerivative) ([]byte, error) {
 	blob, contentType, err := s.getAttachmentProcessedBlob(ctx, attachment, derivative.process)
 	if err != nil {
-		if errors.Is(err, storage.ErrObjectProcessingRefused) {
-			return nil, errors.Wrapf(errThumbnailUnsupported, "storage provider refused the image: %v", err)
-		}
-		return nil, errors.Wrap(err, "failed to read processed object")
+		// A remote failure is never a verdict on the image: a wrong expression, a
+		// rejected signature, a deleted key or a missing permission are all
+		// deployment mistakes, and remembering them as "this image cannot be
+		// derived" would keep the derivative from ever appearing after the mistake
+		// is fixed. Serve the stored object and say why.
+		slog.Warn("storage provider did not produce the derivative; serving the stored object",
+			"attachment_uid", attachment.UID,
+			"refused", errors.Is(err, storage.ErrObjectProcessingRefused),
+			"error", err.Error(),
+			"process", derivative.process)
+		return nil, errUseOriginalForThumbnail
 	}
 	// A backend with no processing pipeline ignores the expression and answers
 	// with the stored object, whose media type is the one the attachment was
