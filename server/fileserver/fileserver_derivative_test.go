@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/usememos/memos/internal/testutil/fakes3"
-	apiv1 "github.com/usememos/memos/proto/gen/api/v1"
+	apipb "github.com/usememos/memos/proto/gen/api"
 	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
 )
@@ -21,7 +21,7 @@ import (
 // newHeicOnObjectStorage builds a file server whose default storage is an S3
 // endpoint holding one HEIC attachment, and returns the object key so a test can
 // decide what the provider answers with.
-func newHeicOnObjectStorage(ctx context.Context, t *testing.T) (*FileServerService, *fakes3.Server, *apiv1.Attachment, string, func()) {
+func newHeicOnObjectStorage(ctx context.Context, t *testing.T) (*FileServerService, *fakes3.Server, *apipb.Attachment, string, func()) {
 	t.Helper()
 
 	fake := fakes3.New(t, "derivative-attachments")
@@ -54,7 +54,7 @@ func newHeicOnObjectStorage(ctx context.Context, t *testing.T) (*FileServerServi
 	return fs, fake, attachment, key, cleanup
 }
 
-func getAttachment(t *testing.T, fs *FileServerService, attachment *apiv1.Attachment, query string) *httptest.ResponseRecorder {
+func getAttachment(t *testing.T, fs *FileServerService, attachment *apipb.Attachment, query string) *httptest.ResponseRecorder {
 	t.Helper()
 	e := echo.New()
 	fs.RegisterRoutes(e)
