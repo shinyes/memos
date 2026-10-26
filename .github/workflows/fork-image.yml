@@ -40,8 +40,9 @@ jobs:
   # Resolved once so the image tags and the release tag can never disagree.
   #
   # The release tag is `<upstream release tag>-c.<build date>.<run number>`,
-  # for example `v0.31.0-c.26.10.04.5`: it names the upstream version this fork is
-  # based on, the UTC day the image was built, and the run that produced it.
+  # for example `26.10-rc.1-c.26.10.26.17`: it names the newest upstream release,
+  # release candidates included, the UTC day the image was built, and the run
+  # that produced it.
   #   * the date says when the image was built, which a run number does not;
   #   * the run number keeps a second build on the same day from colliding.
   #
@@ -65,7 +66,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="$(bash scripts/release_version.sh development-version)"
-          upstream="$(gh api repos/usememos/memos/releases/latest --jq .tag_name 2>/dev/null || true)"
+          # The newest published release, release candidates included. While a
+          # calendar version is in testing, `releases/latest` still answers with the
+          # previous stable tag, so the build would be named after a release line
+          # it has already moved past. The list endpoint is newest first.
+          upstream="$(gh api 'repos/usememos/memos/releases?per_page=1' --jq '.[0].tag_name // empty' 2>/dev/null || true)"
           upstream="${upstream:-v0.0.0}"
           # Build date in UTC, the clock the repository's own development version
           # is derived from.
