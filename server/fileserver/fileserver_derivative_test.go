@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/require"
 
+	"github.com/usememos/memos/internal/httphandler"
 	"github.com/usememos/memos/internal/testutil/fakes3"
 	apipb "github.com/usememos/memos/proto/gen/api"
 	storepb "github.com/usememos/memos/proto/gen/store"
@@ -36,10 +36,9 @@ func newHeicOnObjectStorage(ctx context.Context, t *testing.T) (*FileServerServi
 	_, err := svc.Store.UpsertInstanceSetting(ctx, &storepb.InstanceSetting{
 		Key: storepb.InstanceSettingKey_STORAGE,
 		Value: &storepb.InstanceSetting_StorageSetting{StorageSetting: &storepb.InstanceStorageSetting{
-			FilepathTemplate:  "files/{uuid}_{filename}",
-			UploadSizeLimitMb: 30,
-			Storages:          []*storepb.Storage{configuredStorage},
-			DefaultStorageId:  configuredStorage.Id,
+			FilepathTemplate: "files/{uuid}_{filename}",
+			Storages:         []*storepb.Storage{configuredStorage},
+			DefaultStorageId: configuredStorage.Id,
 		}},
 	})
 	require.NoError(t, err)
@@ -56,10 +55,10 @@ func newHeicOnObjectStorage(ctx context.Context, t *testing.T) (*FileServerServi
 
 func getAttachment(t *testing.T, fs *FileServerService, attachment *apipb.Attachment, query string) *httptest.ResponseRecorder {
 	t.Helper()
-	e := echo.New()
-	fs.RegisterRoutes(e)
+	mux := http.NewServeMux()
+	fs.RegisterRoutes(mux, http.HandlerFunc(httphandler.NotFound))
 	recorder := httptest.NewRecorder()
-	e.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/file/%s/%s%s", attachment.Name, attachment.Filename, query), nil))
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/file/%s/%s%s", attachment.Name, attachment.Filename, query), nil))
 	return recorder
 }
 
@@ -75,7 +74,7 @@ func TestServeAttachmentFile_ProviderFormatIsServedAsTheDerivative(t *testing.T)
 
 	display := getAttachment(t, fs, attachment, "")
 	require.Equal(t, http.StatusOK, display.Code)
-	require.Equal(t, displayContentType, display.Header().Get(echo.HeaderContentType))
+	require.Equal(t, displayContentType, display.Header().Get("Content-Type"))
 	require.Equal(t, []byte("rendered avif"), display.Body.Bytes())
 
 	uid := strings.TrimPrefix(attachment.Name, "attachments/")
@@ -94,7 +93,7 @@ func TestServeAttachmentFile_ProviderThumbnailIsServedAsJPEG(t *testing.T) {
 
 	thumbnail := getAttachment(t, fs, attachment, "?thumbnail=true")
 	require.Equal(t, http.StatusOK, thumbnail.Code)
-	require.Equal(t, "image/jpeg", thumbnail.Header().Get(echo.HeaderContentType))
+	require.Equal(t, "image/jpeg", thumbnail.Header().Get("Content-Type"))
 	require.Equal(t, []byte("rendered jpeg"), thumbnail.Body.Bytes())
 
 	uid := strings.TrimPrefix(attachment.Name, "attachments/")
@@ -114,12 +113,12 @@ func TestServeAttachmentFile_UnprocessedAnswerIsNotTreatedAsADerivative(t *testi
 	// which is what a plain S3 backend does.
 	display := getAttachment(t, fs, attachment, "")
 	require.Equal(t, http.StatusOK, display.Code)
-	require.Equal(t, "image/heic", display.Header().Get(echo.HeaderContentType), "the stored object keeps its own media type")
+	require.Equal(t, "image/heic", display.Header().Get("Content-Type"), "the stored object keeps its own media type")
 	require.Equal(t, []byte("stored heic bytes"), display.Body.Bytes())
 
 	thumbnail := getAttachment(t, fs, attachment, "?thumbnail=true")
 	require.Equal(t, http.StatusOK, thumbnail.Code)
-	require.Equal(t, "image/heic", thumbnail.Header().Get(echo.HeaderContentType))
+	require.Equal(t, "image/heic", thumbnail.Header().Get("Content-Type"))
 	require.Equal(t, []byte("stored heic bytes"), thumbnail.Body.Bytes())
 
 	uid := strings.TrimPrefix(attachment.Name, "attachments/")
@@ -131,7 +130,7 @@ func TestServeAttachmentFile_UnprocessedAnswerIsNotTreatedAsADerivative(t *testi
 	// media type the attachment declares.
 	original := getAttachment(t, fs, attachment, "?original=true")
 	require.Equal(t, http.StatusOK, original.Code)
-	require.Equal(t, "image/heic", original.Header().Get(echo.HeaderContentType))
+	require.Equal(t, "image/heic", original.Header().Get("Content-Type"))
 	require.Equal(t, []byte("stored heic bytes"), original.Body.Bytes())
 }
 
@@ -149,7 +148,7 @@ func TestServeAttachmentFile_SubstitutedFormatIsNotTheDisplayDerivative(t *testi
 
 	display := getAttachment(t, fs, attachment, "")
 	require.Equal(t, http.StatusOK, display.Code)
-	require.NotEqual(t, displayContentType, display.Header().Get(echo.HeaderContentType), "JPEG must not be served as the in-page derivative")
+	require.NotEqual(t, displayContentType, display.Header().Get("Content-Type"), "JPEG must not be served as the in-page derivative")
 
 	uid := strings.TrimPrefix(attachment.Name, "attachments/")
 	require.NoFileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, uid+displayCacheSuffix),
@@ -158,7 +157,7 @@ func TestServeAttachmentFile_SubstitutedFormatIsNotTheDisplayDerivative(t *testi
 	// The thumbnail asked for JPEG and got JPEG, so that answer is legitimate.
 	thumbnail := getAttachment(t, fs, attachment, "?thumbnail=true")
 	require.Equal(t, http.StatusOK, thumbnail.Code)
-	require.Equal(t, "image/jpeg", thumbnail.Header().Get(echo.HeaderContentType))
+	require.Equal(t, "image/jpeg", thumbnail.Header().Get("Content-Type"))
 	require.Equal(t, []byte("substituted jpeg"), thumbnail.Body.Bytes())
 	require.FileExists(t, filepath.Join(fs.Profile.Data, thumbnailCacheFolder, thumbnailDerivative.cacheName(uid)))
 }
