@@ -425,10 +425,10 @@ git push origin feat/object-storage-image-derivatives
 
 ```
 <上游最新发版号>-c.<构建日期 YY.MM.DD, UTC>.<运行号>
-例：26.10-rc.1-c.26.10.26.17
+例：26.10.0-rc.2-c.26.10.27.18
 ```
 
-「上游最新发版号」包含 `-rc.N` 预发布版：构建时取 `repos/usememos/memos/releases` 的最新一条，所以 26.10 处在 RC 测试期时镜像名就是 `26.10-rc.1-c.…`，不会还挂在上一版正式版 `v0.31.0` 上。
+「上游最新发版号」包含 `-rc.N` 预发布版：构建时取 `repos/usememos/memos/releases` 的最新一条，所以 26.10 处在 RC 测试期时镜像名就是 `26.10.0-rc.2-c.…`，不会还挂在上一版正式版 `v0.31.0` 上。
 
 各部分的理由：
 
@@ -437,7 +437,7 @@ git push origin feat/object-storage-image-derivatives
 | 构建日期 | 说明镜像哪天构建的——运行号做不到这件事 |
 | 运行号 | 保证同一天多次构建不撞 tag；工作流级单调递增，永不重复 |
 
-**前缀问题（重要）**：tag 刻意不加 `fork-` 前缀。代价是上游改用 CalVer 之后，tag 形如 `26.10-rc.1-c.26.10.26.17`——**以两位数字开头**，而 `[1-9][0-9].*` 正是触发上游发布工作流的 glob。之所以仍可接受：**tag 由 `gh release create` 通过 API 创建，而 API 建 ref 不产生 `push` 事件**，只有 git 推送 tag 才会。因此唯一的纪律是**永不推送 tag**（见下方运维提示）。首次验证：本 fork 上由 API 创建的 tag 没有触发任何额外汇作流运行。
+**前缀问题（重要）**：tag 刻意不加 `fork-` 前缀。代价是上游改用 CalVer 之后，tag 形如 `26.10.0-rc.2-c.26.10.27.18`——**以两位数字开头**，而 `[1-9][0-9].*` 正是触发上游发布工作流的 glob。之所以仍可接受：**tag 由 `gh release create` 通过 API 创建，而 API 建 ref 不产生 `push` 事件**，只有 git 推送 tag 才会。因此唯一的纪律是**永不推送 tag**（见下方运维提示）。首次验证：本 fork 上由 API 创建的 tag 没有触发任何额外汇作流运行。
 
 上游版本号每次构建实时取自 `gh api 'repos/usememos/memos/releases?per_page=1'`（含预发布），所以**上游发新版后 fork tag 自动跟随**。注意它表示"基于哪条上游发布线"，不等于"恰好是那个发版"——本分支基线通常是 `upstream/main` 的最新提交，领先最后一次发版。（`scripts/release_version.sh` 只接受 CalVer，所以本 fork 的 tag 官方工具链不认，这是刻意的。）
 
